@@ -155,11 +155,15 @@ class LocalPortfolioStateStore(PortfolioStateStore):
                 from ..rules.drawdown import DrawdownTracker
                 drawdown_tracker = DrawdownTracker.from_dict(data["drawdown_tracker"])
             
+            # Load positions if present
+            positions_by_instrument = data.get("positions_by_instrument")
+            
             return CurrentPortfolioState(
                 strategy_allocations=data["strategy_allocations"],
                 total_capital=data["total_capital"],
                 timestamp=datetime.fromisoformat(data["timestamp"]),
-                drawdown_tracker=drawdown_tracker
+                drawdown_tracker=drawdown_tracker,
+                positions_by_instrument=positions_by_instrument
             )
             
         except Exception as e:
@@ -238,10 +242,18 @@ class LocalPortfolioStateStore(PortfolioStateStore):
             # Extract state IDs and sort by filename (which contains timestamp)
             state_ids = [f.stem for f in state_files]
             
-            # Sort by filename (most recent first - assuming timestamp-based IDs)
-            state_ids.sort(reverse=True)
+            # Filter to only _after states (most recent completed state)
+            # _before states are snapshots, _after states are the final state after cycle completion
+            after_state_ids = [sid for sid in state_ids if sid.endswith('_after')]
             
-            return state_ids
+            if after_state_ids:
+                # Sort by filename (most recent first - assuming timestamp-based IDs)
+                after_state_ids.sort(reverse=True)
+                return after_state_ids
+            else:
+                # Fallback: if no _after states, use all states sorted by timestamp
+                state_ids.sort(reverse=True)
+                return state_ids
             
         except Exception as e:
             raise PortfolioStateStoreError(f"Failed to list states for portfolio {portfolio_id}: {e}") from e

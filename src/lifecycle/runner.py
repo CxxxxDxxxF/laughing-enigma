@@ -89,6 +89,8 @@ class PortfolioCycleConfig:
     ruleset_type: Optional[str] = None  # "topstep" or None
     ruleset_config: Optional[Dict[str, Any]] = None
     cycle_id: Optional[str] = None
+    validation_hold_quantity: bool = False  # Phase 15 validation-only: skip allocation/rebalance, hold positions
+    validation_bootstrap_first_cycle: bool = True  # Phase 15: run cycle 1 normally to establish position
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'PortfolioCycleConfig':
@@ -159,6 +161,10 @@ class PortfolioCycleConfig:
             ruleset_type = data.get("ruleset_type")
             ruleset_config = data.get("ruleset_config")
             
+            # Validation-only flags (Phase 15)
+            validation_hold_quantity = data.get("validation_hold_quantity", False)
+            validation_bootstrap_first_cycle = data.get("validation_bootstrap_first_cycle", True)
+            
             return cls(
                 portfolio_id=data["portfolio_id"],
                 evaluation_config=eval_config,
@@ -170,6 +176,8 @@ class PortfolioCycleConfig:
                 ruleset_type=ruleset_type,
                 ruleset_config=ruleset_config,
                 cycle_id=data.get("cycle_id"),
+                validation_hold_quantity=validation_hold_quantity,
+                validation_bootstrap_first_cycle=validation_bootstrap_first_cycle,
             )
         except KeyError as e:
             raise CycleError(f"Missing required config field: {e}") from e
@@ -274,6 +282,7 @@ class CycleResult:
     rules_violations: List[Dict[str, Any]] = None  # List of RulesViolation dicts
     ruleset_type: Optional[str] = None
     ruleset_config: Optional[Dict[str, Any]] = None
+    survivability_control_events: List[Dict[str, Any]] = None  # List of ControlEvent dicts
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
@@ -304,6 +313,8 @@ def run_portfolio_cycle(
     state_store: Optional[PortfolioStateStore] = None,
     cycle_id: Optional[str] = None
 ) -> CycleResult:
+    # Step 0: Debug print - verify flags are being read
+    print(f"RUN_CYCLE cycle_id={config.cycle_id or cycle_id} hold={config.validation_hold_quantity} bootstrap={config.validation_bootstrap_first_cycle}")
     """Run a complete portfolio lifecycle cycle.
     
     Orchestrates:
@@ -362,20 +373,67 @@ def run_portfolio_cycle(
         current_state = None
         if state_store:
             current_state = state_store.load_latest_state(config.portfolio_id)
+            # DEBUG: Print loaded state info
             if current_state:
-                # Save snapshot of state before cycle with unique ID
+                print(f"  Loaded state: allocations={list(current_state.strategy_allocations.keys()) if current_state.strategy_allocations else []}, len={len(current_state.strategy_allocations)}")
+            else:
+                print(f"  No state loaded (first cycle)")
+            if current_state:
+                # Save snapshot of state before cycle with unique ID (preserve drawdown_tracker)
                 state_before_id = state_store.save_state(
                     config.portfolio_id,
                     CurrentPortfolioState(
                         strategy_allocations=current_state.strategy_allocations,
                         total_capital=current_state.total_capital,
-                        timestamp=current_state.timestamp  # Preserve original state timestamp
+                        timestamp=current_state.timestamp,  # Preserve original state timestamp
+                        drawdown_tracker=current_state.drawdown_tracker,  # Preserve tracker
+                        positions_by_instrument=current_state.positions_by_instrument  # Preserve positions
                     ),
                     state_id=f"{cycle_id}_before"  # Use cycle_id prefix for unique ID
                 )
+                
+                # Guardrail: Check for time reversal (timestamp monotonicity)
+                # Execution timestamp must be >= last state timestamp
+                if cycle_timestamp < current_state.timestamp:
+                    # Time reversal detected - HALT cycle
+                    return CycleResult(
+                        cycle_id=cycle_id,
+                        cycle_timestamp=cycle_timestamp,
+                        portfolio_id=config.portfolio_id,
+                        evaluation_id=None,
+                        allocation_id=None,
+                        rebalance_plan_id=None,
+                        rebalance_execution_id=None,
+                        state_before_id=state_before_id,
+                        state_after_id=None,
+                        summary={},
+                    status="halted",
+                    skip_reason=f"Time reversal detected: cycle timestamp {cycle_timestamp.isoformat()} < last state timestamp {current_state.timestamp.isoformat()}",
+                    rules_violations=[{
+                        "code": "TIME_REVERSAL",
+                        "message": f"Execution timestamp {cycle_timestamp.isoformat()} is before last state timestamp {current_state.timestamp.isoformat()}",
+                        "severity": "halt",
+                        "metadata": {
+                            "cycle_timestamp": cycle_timestamp.isoformat(),
+                            "last_state_timestamp": current_state.timestamp.isoformat(),
+                        }
+                    }],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
+                )
         
         # Step 0.5: Check cadence (if configured)
-        if config.cadence_config:
+        # Normalize cadence_config to CycleCadenceConfig object if it's a dict
+        cadence_config_obj = config.cadence_config
+        if cadence_config_obj and isinstance(cadence_config_obj, dict):
+            cadence_config_obj = CycleCadenceConfig(
+                frequency=cadence_config_obj.get("frequency", "manual"),
+                min_seconds_between_cycles=cadence_config_obj.get("min_seconds_between_cycles"),
+                timezone=cadence_config_obj.get("timezone", "UTC")
+            )
+        
+        if cadence_config_obj:
             # Load last cycle timestamp (from last cycle result if available)
             # For simplicity, check if we have a recent state timestamp
             last_cycle_timestamp = None
@@ -383,7 +441,7 @@ def run_portfolio_cycle(
                 last_cycle_timestamp = current_state.timestamp
             
             should_run, skip_reason = check_cadence(
-                config.cadence_config,
+                cadence_config_obj,
                 last_cycle_timestamp,
                 cycle_timestamp
             )
@@ -406,6 +464,7 @@ def run_portfolio_cycle(
                     rules_violations=[],
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
                 )
         
         # Initialize current state if not loaded
@@ -413,28 +472,46 @@ def run_portfolio_cycle(
             current_state = CurrentPortfolioState(
                 strategy_allocations={},
                 total_capital=config.allocation_config.total_capital,
-                timestamp=cycle_timestamp
+                timestamp=cycle_timestamp,
+                positions_by_instrument=None
             )
             if state_store:
                 state_before_id = state_store.save_state(config.portfolio_id, current_state)
         
-        # Step 1: Batch evaluation
-        evaluation = run_batch_evaluation(
-            config=config.evaluation_config,
-            research_engine=research_engine,
-            artifact_store=artifact_store,
-            execution_engine_factory=execution_engine_factory
-        )
-        evaluation_id = evaluation.evaluation_id
+        # Check if we should bootstrap first cycle or use hold-quantity validation mode
+        should_use_hold_quantity_mode = config.validation_hold_quantity
+        is_first_cycle = current_state is None or len(current_state.strategy_allocations) == 0
+        use_normal_cycle = not should_use_hold_quantity_mode or (config.validation_bootstrap_first_cycle and is_first_cycle)
         
-        # Step 2: Capital allocation
-        allocation_result = allocate_capital(
-            evaluation=evaluation,
-            config=config.allocation_config
-        )
+        # DEBUG: Print cycle decision logic
+        print(f"  should_use_hold_quantity_mode={should_use_hold_quantity_mode}")
+        print(f"  is_first_cycle={is_first_cycle} (current_state={current_state is not None}, allocations_len={len(current_state.strategy_allocations) if current_state else 0})")
+        print(f"  validation_bootstrap_first_cycle={config.validation_bootstrap_first_cycle}")
+        print(f"  use_normal_cycle={use_normal_cycle}")
         
-        # Check allocation guardrails
-        if config.guardrails_config:
+        # Step 1: Batch evaluation (skip if hold-quantity mode)
+        evaluation = None
+        evaluation_id = None
+        if use_normal_cycle:
+            evaluation = run_batch_evaluation(
+                config=config.evaluation_config,
+                research_engine=research_engine,
+                artifact_store=artifact_store,
+                execution_engine_factory=execution_engine_factory
+            )
+            evaluation_id = evaluation.evaluation_id
+        
+        # Step 2: Capital allocation (skip if hold-quantity mode)
+        allocation_result = None
+        allocation_id = None
+        if use_normal_cycle:
+            allocation_result = allocate_capital(
+                evaluation=evaluation,
+                config=config.allocation_config
+            )
+        
+        # Check allocation guardrails (skip if hold-quantity mode)
+        if use_normal_cycle and config.guardrails_config:
             alloc_list = [{"allocation_fraction": a.allocation_fraction} for a in allocation_result.allocations]
             passes, violation = check_allocation_guardrails(
                 config.guardrails_config,
@@ -468,17 +545,72 @@ def run_portfolio_cycle(
                     rules_violations=[],
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
                 )
         
-        from ..allocation.allocator import persist_allocation
-        allocation_id = persist_allocation(allocation_result, artifact_store)
+        if use_normal_cycle:
+            from ..allocation.allocator import persist_allocation
+            allocation_id = persist_allocation(allocation_result, artifact_store)
+            
+            # Step 2.5: Apply survivability controls (clamp allocations to position size limits)
+            survivability_control_events: List[Dict[str, Any]] = []
+            if config.ruleset_type == "topstep" and config.ruleset_config:
+                from ..control import SurvivabilityControlConfig, apply_survivability_controls
+                
+                # Extract max_position_size from ruleset config
+                max_position_size = config.ruleset_config.get("max_position_size")
+                if max_position_size is not None:
+                    # Get prices from execution config
+                    price_by_strategy_or_instrument = config.execution_config.get(
+                        "price_by_strategy_or_instrument", {}
+                    )
+                    
+                    # Get instrument (assumes single instrument per portfolio)
+                    # Extract from execution engine factory by creating a temporary engine
+                    instrument = None
+                    try:
+                        temp_engine = execution_engine_factory()
+                        if hasattr(temp_engine, 'instrument'):
+                            instrument = temp_engine.instrument
+                    except Exception:
+                        # If engine creation fails, try to infer from price dict
+                        # Try common instrument keys first
+                        for key in ["AAPL", "SPY", "ES"]:  # Common instrument identifiers
+                            if key in price_by_strategy_or_instrument:
+                                instrument = key
+                                break
+                    
+                    # Create control config
+                    control_config = SurvivabilityControlConfig(
+                        position_cap_policy="cap_quantity",
+                        max_position_size_default=max_position_size,
+                        allow_cash_residual=True,
+                        redistribute_residual=False  # Default: leave residual as cash
+                    )
+                    
+                    # Apply controls
+                    allocation_result, control_events = apply_survivability_controls(
+                        allocation_result=allocation_result,
+                        price_by_strategy_or_instrument=price_by_strategy_or_instrument,
+                        config=control_config,
+                        instrument=instrument
+                    )
+                    
+                    # Convert events to dicts
+                    survivability_control_events = [e.to_dict() for e in control_events]
+                    
+                    # Repersist adjusted allocation
+                    allocation_id = persist_allocation(allocation_result, artifact_store)
         
-        # Step 3: Rebalance planning
-        rebalance_plan = plan_rebalance(
-            allocation_result=allocation_result,
-            current_state=current_state,
-            config=config.rebalance_config
-        )
+        # Step 3: Rebalance planning (skip if hold-quantity mode)
+        rebalance_plan = None
+        rebalance_plan_id = None
+        if use_normal_cycle:
+            rebalance_plan = plan_rebalance(
+                allocation_result=allocation_result,
+                current_state=current_state,
+                config=config.rebalance_config
+            )
         
         # Check rebalance guardrails
         if config.guardrails_config:
@@ -515,13 +647,15 @@ def run_portfolio_cycle(
                     rules_violations=[],
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
                 )
         
-        from ..rebalance.planner import persist_rebalance_plan
-        rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
+        if use_normal_cycle:
+            from ..rebalance.planner import persist_rebalance_plan
+            rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
         
-        # Step 3.5: Validate rebalance plan against ruleset
-        if config.ruleset_type == "topstep" and config.ruleset_config:
+        # Step 3.5: Validate rebalance plan against ruleset (skip if hold-quantity mode)
+        if use_normal_cycle and config.ruleset_type == "topstep" and config.ruleset_config:
             from ..rules import TopstepRulesConfig, TopstepRuleset
             ruleset_config = TopstepRulesConfig(**config.ruleset_config)
             ruleset = TopstepRuleset(ruleset_config)
@@ -555,29 +689,35 @@ def run_portfolio_cycle(
                     rules_violations=[v.to_dict() for v in rules_violations],
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
                 )
         
-        # Step 4: Rebalance execution
-        execution_engine = execution_engine_factory()
+        # Step 4: Rebalance execution (skip if hold-quantity mode)
+        execution_engine = None
+        execution_result = None
+        rebalance_execution_id = None
         
-        price_by_strategy_or_instrument = config.execution_config.get(
-            "price_by_strategy_or_instrument", {}
-        )
+        if use_normal_cycle:
+            execution_engine = execution_engine_factory()
+            
+            price_by_strategy_or_instrument = config.execution_config.get(
+                "price_by_strategy_or_instrument", {}
+            )
+            
+            mapper = RebalanceSignalMapper(
+                rounding_method=config.execution_config.get("rounding_method", "floor"),
+                min_quantity=config.execution_config.get("min_quantity", 0.0)
+            )
+            
+            execution_result = execute_rebalance_plan(
+                plan=rebalance_plan,
+                execution_engine=execution_engine,
+                price_by_strategy_or_instrument=price_by_strategy_or_instrument,
+                mapper=mapper
+            )
         
-        mapper = RebalanceSignalMapper(
-            rounding_method=config.execution_config.get("rounding_method", "floor"),
-            min_quantity=config.execution_config.get("min_quantity", 0.0)
-        )
-        
-        execution_result = execute_rebalance_plan(
-            plan=rebalance_plan,
-            execution_engine=execution_engine,
-            price_by_strategy_or_instrument=price_by_strategy_or_instrument,
-            mapper=mapper
-        )
-        
-        # Check execution guardrails
-        if config.guardrails_config:
+        # Check execution guardrails (skip if hold-quantity mode)
+        if use_normal_cycle and config.guardrails_config:
             passes, violation = check_execution_guardrails(
                 config.guardrails_config,
                 execution_result.execution_summary["successful_intents"],
@@ -613,12 +753,27 @@ def run_portfolio_cycle(
                     rules_violations=[],
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
                 )
         
-        from ..rebalance.executor import persist_rebalance_execution
-        rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+        if use_normal_cycle:
+            from ..rebalance.executor import persist_rebalance_execution
+            rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
         
-        # Step 4.5: Validate execution against ruleset
+        # Step 4.5: Validate execution against ruleset (or mark-to-market validation for hold-quantity mode)
+        # Initialize ruleset if configured
+        if config.ruleset_type == "topstep" and config.ruleset_config:
+            from ..rules import TopstepRulesConfig, TopstepRuleset
+            if ruleset is None:
+                ruleset_config = TopstepRulesConfig(**config.ruleset_config)
+                ruleset = TopstepRuleset(ruleset_config)
+        
+        # Initialize computed_equity in outer scope (used in hold-quantity mode)
+        computed_equity = None
+        
+        # DEBUG: Print which path we're taking
+        print(f"  use_normal_cycle={use_normal_cycle}, ruleset={ruleset is not None}")
+        
         if ruleset:
             # Get current prices from execution config for equity calculation
             price_by_strategy_or_instrument = config.execution_config.get(
@@ -626,7 +781,7 @@ def run_portfolio_cycle(
             )
             # Convert to instrument -> price mapping (assumes single instrument per engine)
             current_prices = {}
-            if execution_engine and hasattr(execution_engine, 'instrument'):
+            if use_normal_cycle and execution_engine and hasattr(execution_engine, 'instrument'):
                 instrument = execution_engine.instrument
                 # Try instrument key first, then try strategy keys
                 price = price_by_strategy_or_instrument.get(instrument)
@@ -637,11 +792,240 @@ def run_portfolio_cycle(
                         break
                 if price is not None:
                     current_prices[instrument] = price
+            elif not use_normal_cycle:
+                # Hold-quantity mode: extract prices from config
+                # Assumes single instrument (same as normal mode)
+                # Try to find instrument key first (e.g., "AAPL"), then fallback to strategy keys
+                if current_state.positions_by_instrument:
+                    # Extract instrument from positions
+                    instrument = list(current_state.positions_by_instrument.keys())[0]
+                    price = price_by_strategy_or_instrument.get(instrument)
+                    if price is not None:
+                        current_prices[instrument] = price
+                    else:
+                        # Fallback to first value in price dict
+                        for key, val in price_by_strategy_or_instrument.items():
+                            current_prices[key] = val
+                            break
+                else:
+                    # No positions, take first price from config
+                    for key, val in price_by_strategy_or_instrument.items():
+                        current_prices[key] = val
+                        break
             
-            exec_violations = ruleset.validate_execution(
-                execution_result, current_state, execution_engine=execution_engine, current_prices=current_prices
-            )
-            rules_violations.extend(exec_violations)
+            # Initialize exec_violations for halt check
+            exec_violations = []
+            
+            if use_normal_cycle:
+                # Normal mode: validate execution result
+                # Create day boundary for validation (if configured)
+                from ..rules.day_boundary import TradingDayBoundary
+                day_boundary = TradingDayBoundary()  # Default UTC
+                
+                # validate_execution expects day_boundary parameter for Topstep ruleset
+                import inspect
+                sig = inspect.signature(ruleset.validate_execution)
+                if 'day_boundary' in sig.parameters:
+                    exec_violations = ruleset.validate_execution(
+                        execution_result, current_state, execution_engine=execution_engine, 
+                        current_prices=current_prices, day_boundary=day_boundary
+                    )
+                else:
+                    exec_violations = ruleset.validate_execution(
+                        execution_result, current_state, execution_engine=execution_engine, 
+                        current_prices=current_prices
+                    )
+                rules_violations.extend(exec_violations)
+            else:
+                # Hold-quantity mode: mark-to-market validation using positions from state
+                # Contract: This is the ONLY place equity is computed and tracker is updated
+                # validate_execution(skip_equity_recalculation=True) will NOT recompute or update again
+                
+                # Initialize survivability_control_events for this branch
+                survivability_control_events = []
+                
+                # Step 1: Reconstruct positions from current_state.positions_by_instrument
+                from ..execution.position import Position
+                from ..rules.drawdown import calculate_portfolio_equity
+                positions = {}
+                if current_state.positions_by_instrument:
+                    for instrument, pos_dict in current_state.positions_by_instrument.items():
+                        positions[instrument] = Position.from_dict(pos_dict)
+                
+                # DEBUG: Prove positions and prices exist
+                print(f"  positions_by_instrument count: {len(current_state.positions_by_instrument or {})}")
+                print(f"  positions_by_instrument keys: {list((current_state.positions_by_instrument or {}).keys())}")
+                print(f"  current_prices size: {len(current_prices)}")
+                print(f"  current_prices keys: {list(current_prices.keys())}")
+                if "AAPL" in current_prices:
+                    print(f"  AAPL price: ${current_prices['AAPL']:.2f}")
+                else:
+                    print(f"  WARNING: AAPL not in current_prices")
+                
+                # Assert invariants - stop if data is missing
+                assert current_state.positions_by_instrument, "No positions present in state, cannot mark-to-market"
+                assert current_prices, "current_prices empty, cannot mark-to-market"
+                assert "AAPL" in current_prices, "Missing AAPL price"
+                
+                # Step 2: Build current_prices from execution_config
+                if not current_prices:
+                    price_by_strategy_or_instrument = config.execution_config.get(
+                        "price_by_strategy_or_instrument", {}
+                    )
+                    if current_state.positions_by_instrument:
+                        instrument = list(current_state.positions_by_instrument.keys())[0]
+                        price = price_by_strategy_or_instrument.get(instrument)
+                        if price is None:
+                            # Fallback to first value
+                            price = list(price_by_strategy_or_instrument.values())[0] if price_by_strategy_or_instrument else None
+                        if price is not None:
+                            current_prices[instrument] = price
+                
+                # Step 3: Compute mark-to-market equity
+                initial_cash = current_state.total_capital
+                total_realized_pnl = sum(pos.realized_pnl for pos in positions.values())
+                
+                if current_prices:
+                    equity, unrealized_pnl = calculate_portfolio_equity(
+                        initial_cash=initial_cash,
+                        positions=positions,
+                        current_prices=current_prices,
+                        realized_pnl=total_realized_pnl
+                    )
+                else:
+                    # No prices available, use realized PnL only (conservative)
+                    equity = initial_cash + total_realized_pnl
+                    unrealized_pnl = 0.0
+                
+                # Step 4: Update drawdown tracker with computed equity (ONLY update point in hold-quantity mode)
+                # validate_execution(skip_equity_recalculation=True) will NOT recompute or update again
+                computed_equity = equity  # Store for persistence and proof prints (set in outer scope)
+                if current_state.drawdown_tracker is not None:
+                    from ..rules.day_boundary import TradingDayBoundary
+                    day_boundary = TradingDayBoundary()  # Default UTC
+                    
+                    # Update tracker with mark-to-market equity
+                    snapshot = current_state.drawdown_tracker.update(
+                        equity=equity,
+                        realized_pnl=total_realized_pnl,
+                        unrealized_pnl=unrealized_pnl,
+                        timestamp=cycle_timestamp,
+                        day_boundary=day_boundary
+                    )
+                    # Tracker is updated in-place; current_state.drawdown_tracker now has the updated state
+                
+                # Phase 15 validation-only proof prints
+                if positions:
+                    inst = list(positions.keys())[0]
+                    pos = positions[inst]
+                    current_price_val = current_prices.get(inst, 0.0) if current_prices else 0.0
+                    tracker_locked = current_state.drawdown_tracker.is_locked if current_state.drawdown_tracker else False
+                    tracker_hwm = current_state.drawdown_tracker.high_water_mark if current_state.drawdown_tracker else 0.0
+                    print(f"  [Hold-Qty Validation] price=${current_price_val:.2f}, qty={pos.quantity:.1f}, "
+                          f"equity=${computed_equity:,.2f}, locked={tracker_locked}, hwm=${tracker_hwm:,.2f}")
+                
+                # Apply survivability controls to positions (Phase 16: enforce position size caps)
+                if config.ruleset_type == "topstep" and config.ruleset_config:
+                    from ..control import ControlEvent, ControlEventSeverity
+                    
+                    max_position_size = config.ruleset_config.get("max_position_size")
+                    if max_position_size is not None:
+                        # Get current prices
+                        price_by_strategy_or_instrument = config.execution_config.get(
+                            "price_by_strategy_or_instrument", {}
+                        )
+                        
+                        # Apply position size caps to each position
+                        position_control_events = []
+                        for inst, position in positions.items():
+                            # Get price for this instrument
+                            price = price_by_strategy_or_instrument.get(inst)
+                            if price is None or price <= 0:
+                                continue
+                            
+                            # Check if quantity exceeds max_position_size
+                            if abs(position.quantity) > max_position_size:
+                                # Clamp quantity to max_position_size (preserve direction)
+                                original_quantity = position.quantity
+                                capped_quantity = max_position_size if original_quantity > 0 else -max_position_size
+                                
+                                # Create new Position with capped quantity (Position is immutable)
+                                positions[inst] = Position(
+                                    instrument=position.instrument,
+                                    quantity=capped_quantity,
+                                    cost_basis=position.cost_basis,
+                                    realized_pnl=position.realized_pnl,
+                                    updated_at=position.updated_at
+                                )
+                                
+                                # Record control event
+                                utilization = abs(original_quantity) / max_position_size
+                                event = ControlEvent(
+                                    code="POSITION_SIZE_CAP_BINDING",
+                                    message=f"Position {inst} quantity clamped: "
+                                           f"{original_quantity} -> {capped_quantity} "
+                                           f"(utilization: {utilization:.2%})",
+                                    severity=ControlEventSeverity.WARN,
+                                    metadata={
+                                        "instrument": inst,
+                                        "original_quantity": original_quantity,
+                                        "capped_quantity": capped_quantity,
+                                        "price": price,
+                                        "max_position_size": max_position_size,
+                                        "utilization": utilization,
+                                    }
+                                )
+                                position_control_events.append(event.to_dict())
+                        
+                        # Add position control events to survivability_control_events
+                        if position_control_events:
+                            if 'survivability_control_events' not in locals():
+                                survivability_control_events = []
+                            survivability_control_events.extend(position_control_events)
+                
+                # Create a minimal execution engine with these positions for validation
+                # We only need it for validate_execution, so create it with positions pre-loaded
+                execution_engine = execution_engine_factory()
+                if hasattr(execution_engine, 'positions'):
+                    execution_engine.positions = positions
+                
+                # Create a dummy execution result for validation (no actual execution occurred)
+                # validate_execution needs execution_result.execution_timestamp
+                from ..rebalance.executor import RebalanceExecutionResult
+                dummy_execution_result = RebalanceExecutionResult(
+                    execution_id=f"hold_qty_{cycle_id}",
+                    execution_timestamp=cycle_timestamp,
+                    plan_id="hold_qty_no_plan",
+                    intent_results=[],
+                    execution_summary={"successful_intents": 0, "failed_intents": 0, "total_intents": 0},
+                    mapping={}
+                )
+                
+                # Create day boundary for validation (if configured)
+                from ..rules.day_boundary import TradingDayBoundary
+                day_boundary = TradingDayBoundary()  # Default UTC
+                
+                # validate_execution expects day_boundary parameter for Topstep ruleset
+                # Phase 15: In hold-quantity mode, skip equity recalculation to preserve precomputed equity
+                import inspect
+                sig = inspect.signature(ruleset.validate_execution)
+                if 'skip_equity_recalculation' in sig.parameters:
+                    exec_violations = ruleset.validate_execution(
+                        dummy_execution_result, current_state, execution_engine=execution_engine, 
+                        current_prices=current_prices, day_boundary=day_boundary,
+                        skip_equity_recalculation=True  # Phase 15: use precomputed equity from tracker
+                    )
+                elif 'day_boundary' in sig.parameters:
+                    exec_violations = ruleset.validate_execution(
+                        dummy_execution_result, current_state, execution_engine=execution_engine, 
+                        current_prices=current_prices, day_boundary=day_boundary
+                    )
+                else:
+                    exec_violations = ruleset.validate_execution(
+                        dummy_execution_result, current_state, execution_engine=execution_engine, 
+                        current_prices=current_prices
+                    )
+                rules_violations.extend(exec_violations)
             
             # Check for HALT violations
             halt_violations = [v for v in exec_violations if v.severity == RulesViolationSeverity.HALT]
@@ -671,85 +1055,67 @@ def run_portfolio_cycle(
                     rules_violations=[v.to_dict() for v in rules_violations],
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
+                    survivability_control_events=[],
                 )
         
         # Step 5: Update portfolio state
+        # Note: computed_equity is set in hold-quantity mode block above, and used here for state persistence
         if state_store:
-            # Compute new state from target allocations (since execution succeeded)
-            # Use the allocation_result as the source of truth for target allocations
-            new_allocations = {}
-            for alloc in allocation_result.allocations:
-                strategy_id = alloc.strategy_id
-                new_allocations[strategy_id] = alloc.allocated_capital
-            
-            # Preserve or update drawdown tracker from execution validation
-            drawdown_tracker = None
-            if ruleset and execution_engine:
-                # Get updated drawdown tracker from execution validation
-                # It was updated during validate_execution if Topstep ruleset was used
-                # For now, we'll initialize a new one if needed, but ideally it should be
-                # passed back from validate_execution or stored in execution_result
-                # This is a limitation - we need to recompute equity to update tracker
-                from ..rules.drawdown import DrawdownTracker, calculate_portfolio_equity
-                from datetime import date as date_class
+            if use_normal_cycle:
+                # Normal mode: Compute new state from target allocations (since execution succeeded)
+                # Use the allocation_result as the source of truth for target allocations
+                new_allocations = {}
+                for alloc in allocation_result.allocations:
+                    strategy_id = alloc.strategy_id
+                    new_allocations[strategy_id] = alloc.allocated_capital
                 
-                # Get current prices
-                price_by_strategy_or_instrument = config.execution_config.get(
-                    "price_by_strategy_or_instrument", {}
-                )
-                current_prices = {}
-                if hasattr(execution_engine, 'instrument'):
-                    instrument = execution_engine.instrument
-                    price = price_by_strategy_or_instrument.get(instrument)
-                    if price is None:
-                        for key, val in price_by_strategy_or_instrument.items():
-                            price = val
-                            break
-                    if price is not None:
-                        current_prices[instrument] = price
-                
-                # Get positions
-                positions = execution_engine.positions if hasattr(execution_engine, 'positions') else {}
-                
-                # Calculate equity
-                total_realized_pnl = sum(p.realized_pnl for p in positions.values())
-                initial_cash = allocation_result.total_capital
-                
-                if current_prices:
-                    equity, unrealized_pnl = calculate_portfolio_equity(
-                        initial_cash=initial_cash,
-                        positions=positions,
-                        current_prices=current_prices,
-                        realized_pnl=total_realized_pnl
-                    )
-                else:
-                    equity = initial_cash + total_realized_pnl
-                    unrealized_pnl = 0.0
-                
-                # Get or create drawdown tracker
-                if current_state.drawdown_tracker:
+                # Get updated drawdown tracker from current_state
+                # The tracker was updated during validate_execution if Topstep ruleset was used
+                drawdown_tracker = None
+                if ruleset and hasattr(current_state, 'drawdown_tracker'):
                     drawdown_tracker = current_state.drawdown_tracker
-                else:
-                    drawdown_tracker = DrawdownTracker(
-                        initial_balance=initial_cash,
-                        trading_date=date_class.today()
-                    )
                 
-                # Update tracker
-                drawdown_tracker.update(
-                    equity=equity,
-                    realized_pnl=total_realized_pnl,
-                    unrealized_pnl=unrealized_pnl,
-                    timestamp=cycle_timestamp
+                # Extract positions from execution engine for persistence
+                positions_by_instrument = None
+                if execution_engine and hasattr(execution_engine, 'positions'):
+                    positions_by_instrument = {
+                        instrument: pos.to_dict() 
+                        for instrument, pos in execution_engine.positions.items()
+                    }
+                
+                # Create new state with target allocations, drawdown tracker, and positions
+                new_state = CurrentPortfolioState(
+                    strategy_allocations=new_allocations,
+                    total_capital=allocation_result.total_capital,
+                    timestamp=cycle_timestamp,
+                    drawdown_tracker=drawdown_tracker,
+                    positions_by_instrument=positions_by_instrument
+                )
+            else:
+                # Hold-quantity mode: Preserve positions, update drawdown tracker, persist computed equity
+                # Get updated drawdown tracker from current_state (already updated with computed equity)
+                drawdown_tracker = None
+                if ruleset and hasattr(current_state, 'drawdown_tracker'):
+                    drawdown_tracker = current_state.drawdown_tracker
+                
+                # Use computed equity as total_capital (so equity moves in persisted state)
+                # computed_equity was set in the hold-quantity validation block above
+                # Fallback to current_state.total_capital if somehow not set (should not happen)
+                try:
+                    computed_equity_for_state = computed_equity if computed_equity is not None else current_state.total_capital
+                except NameError:
+                    # Should not happen - computed_equity should always be set in hold-quantity mode
+                    computed_equity_for_state = current_state.total_capital
+                
+                # Create new state with unchanged allocations and positions, updated tracker, computed equity as total_capital
+                new_state = CurrentPortfolioState(
+                    strategy_allocations=current_state.strategy_allocations,
+                    total_capital=computed_equity_for_state,  # Phase 15: persist computed equity
+                    timestamp=cycle_timestamp,
+                    drawdown_tracker=drawdown_tracker,
+                    positions_by_instrument=current_state.positions_by_instrument  # Preserve positions
                 )
             
-            # Create new state with target allocations and drawdown tracker
-            new_state = CurrentPortfolioState(
-                strategy_allocations=new_allocations,
-                total_capital=allocation_result.total_capital,
-                timestamp=cycle_timestamp,
-                drawdown_tracker=drawdown_tracker
-            )
             state_after_id = state_store.save_state(
                 config.portfolio_id,
                 new_state,
@@ -757,17 +1123,27 @@ def run_portfolio_cycle(
             )
         
         # Step 6: Compute cycle summary
-        summary = {
-            "evaluation_summary": evaluation.summary,
-            "allocation_summary": {
-                "total_capital": allocation_result.total_capital,
-                "allocated_capital": allocation_result.allocated_capital,
-                "num_strategies": len(allocation_result.allocations),
-                "top_strategy_id": allocation_result.allocations[0].strategy_id if allocation_result.allocations else None,
-            },
-            "rebalance_summary": rebalance_plan.metrics,
-            "execution_summary": execution_result.execution_summary,
-        }
+        if use_normal_cycle:
+            summary = {
+                "evaluation_summary": evaluation.summary if evaluation else {},
+                "allocation_summary": {
+                    "total_capital": allocation_result.total_capital,
+                    "allocated_capital": allocation_result.allocated_capital,
+                    "num_strategies": len(allocation_result.allocations),
+                    "top_strategy_id": allocation_result.allocations[0].strategy_id if allocation_result.allocations else None,
+                },
+                "rebalance_summary": rebalance_plan.metrics if rebalance_plan else {},
+                "execution_summary": execution_result.execution_summary if execution_result else {},
+            }
+        else:
+            # Hold-quantity mode: minimal summary
+            summary = {
+                "mode": "hold_quantity",
+                "validation_summary": {
+                    "positions_count": len(current_state.positions_by_instrument) if current_state.positions_by_instrument else 0,
+                }
+            }
+        
         
         return CycleResult(
             cycle_id=cycle_id,
@@ -785,6 +1161,7 @@ def run_portfolio_cycle(
             rules_violations=[v.to_dict() for v in rules_violations],
             ruleset_type=config.ruleset_type,
             ruleset_config=config.ruleset_config,
+            survivability_control_events=survivability_control_events,
         )
         
     except Exception as e:

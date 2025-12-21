@@ -151,7 +151,9 @@ class TopstepRuleset(Ruleset):
         execution_result: Any,
         current_state: Any,
         execution_engine: Optional[Any] = None,
-        current_prices: Optional[Dict[str, float]] = None
+        current_prices: Optional[Dict[str, float]] = None,
+        day_boundary: Optional['TradingDayBoundary'] = None,
+        skip_equity_recalculation: bool = False  # Phase 15: when True, use precomputed equity from tracker
     ) -> List[RulesViolation]:
         """Validate execution results against Topstep rules.
         
@@ -191,7 +193,14 @@ class TopstepRuleset(Ruleset):
                 total_realized_pnl += position.realized_pnl
             
             # Calculate current equity and unrealized PnL
-            if current_prices is None:
+            # Phase 15: In validation_hold_quantity mode, equity is precomputed and tracker is already updated
+            # Skip recalculation to avoid overwriting measurement-only equity updates
+            if skip_equity_recalculation and drawdown_tracker and drawdown_tracker.snapshots:
+                # Use equity from the most recent snapshot (already computed correctly in hold-quantity mode)
+                latest_snapshot = drawdown_tracker.snapshots[-1]
+                equity = latest_snapshot.equity
+                unrealized_pnl = latest_snapshot.unrealized_pnl
+            elif current_prices is None:
                 # If no prices provided, we can't calculate unrealized PnL
                 # Use realized PnL only as conservative estimate
                 equity = initial_cash + total_realized_pnl
@@ -212,14 +221,46 @@ class TopstepRuleset(Ruleset):
                     initial_balance=initial_cash,
                     trading_date=date_class.today()
                 )
+                # Store it back in current_state so it persists (CurrentPortfolioState is not frozen)
+                if hasattr(current_state, 'drawdown_tracker'):
+                    current_state.drawdown_tracker = drawdown_tracker
             
-            # Update drawdown tracker with current equity
-            snapshot = drawdown_tracker.update(
-                equity=equity,
-                realized_pnl=total_realized_pnl,
-                unrealized_pnl=unrealized_pnl,
-                timestamp=execution_result.execution_timestamp
-            )
+            # Use day boundary for day rollover detection
+            if day_boundary is None:
+                from .day_boundary import TradingDayBoundary
+                day_boundary = TradingDayBoundary()  # Default: UTC
+            
+            # Phase 15: Only update tracker if we're not skipping equity recalculation
+            # (When skip_equity_recalculation=True, tracker is already updated with correct equity)
+            if not skip_equity_recalculation:
+                snapshot = drawdown_tracker.update(
+                    equity=equity,
+                    realized_pnl=total_realized_pnl,
+                    unrealized_pnl=unrealized_pnl,
+                    timestamp=execution_result.execution_timestamp,
+                    day_boundary=day_boundary
+                )
+            else:
+                # Use existing snapshot (tracker already updated with correct equity in hold-quantity mode)
+                # Just get the latest snapshot without updating
+                if drawdown_tracker and drawdown_tracker.snapshots:
+                    snapshot = drawdown_tracker.snapshots[-1]
+                else:
+                    snapshot = None
+            
+            # Invariant check: Once locked, is_locked must never revert to false
+            if drawdown_tracker.is_locked == False and current_state.drawdown_tracker and current_state.drawdown_tracker.is_locked:
+                violations.append(RulesViolation(
+                    code="DRAW_DOWN_STATE_CORRUPTION",
+                    message="Drawdown tracker lock state corrupted: tracker was locked but is now unlocked",
+                    severity=RulesViolationSeverity.HALT,
+                    metadata={
+                        "previous_is_locked": True,
+                        "current_is_locked": False,
+                        "previous_high_water_mark": current_state.drawdown_tracker.high_water_mark if current_state.drawdown_tracker else None,
+                        "current_high_water_mark": drawdown_tracker.high_water_mark,
+                    }
+                ))
             
             # Check max_daily_loss
             if self.config.max_daily_loss is not None:

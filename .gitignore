@@ -1,0 +1,15 @@
+# Runtime artifacts
+artifacts/
+artifacts_test_continuity/
+artifacts_test_halt/
+
+# Validation outputs
+artifacts/validation/
+artifacts/**/runs/
+
+# JSON state outputs
+*.json
+
+# Keep config JSON files (they're in version control)
+!configs/*.json
+

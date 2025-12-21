@@ -20,6 +20,10 @@ from .drawdown import (
     DrawdownState,
     calculate_portfolio_equity,
 )
+from .day_boundary import (
+    TradingDayBoundary,
+    reset_daily_loss_for_new_day,
+)
 
 __all__ = [
     "Ruleset",
@@ -32,5 +36,7 @@ __all__ = [
     "DrawdownSnapshot",
     "DrawdownState",
     "calculate_portfolio_equity",
+    "TradingDayBoundary",
+    "reset_daily_loss_for_new_day",
 ]
 

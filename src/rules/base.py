@@ -100,7 +100,9 @@ class Ruleset(ABC):
         execution_result: Any,  # RebalanceExecutionResult from rebalance.executor
         current_state: Any,  # CurrentPortfolioState
         execution_engine: Optional[Any] = None,  # ExecutionEngine (optional, for position checks)
-        current_prices: Optional[Dict[str, float]] = None  # Optional current prices for equity calculation
+        current_prices: Optional[Dict[str, float]] = None,  # Optional current prices for equity calculation
+        day_boundary: Optional['TradingDayBoundary'] = None,  # Optional day boundary for day rollover detection
+        skip_equity_recalculation: bool = False  # Phase 15: when True, use precomputed equity from tracker
     ) -> List[RulesViolation]:
         """Validate execution results against rules.
         

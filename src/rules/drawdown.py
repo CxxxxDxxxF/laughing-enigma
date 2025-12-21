@@ -12,10 +12,13 @@ Determinism:
 - No external state or randomness
 """
 
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .day_boundary import TradingDayBoundary
 
 
 class DrawdownState(str, Enum):
@@ -109,7 +112,8 @@ class DrawdownTracker:
         equity: float,
         realized_pnl: float,
         unrealized_pnl: float,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        day_boundary: Optional['TradingDayBoundary'] = None
     ) -> DrawdownSnapshot:
         """Update drawdown tracker with current equity.
         
@@ -131,6 +135,24 @@ class DrawdownTracker:
         """
         if timestamp is None:
             timestamp = datetime.now()
+        
+        # Check for day rollover and handle if needed
+        if day_boundary is not None:
+            previous_timestamp = self.snapshots[-1].timestamp if self.snapshots else None
+            if day_boundary.has_day_rollover(previous_timestamp, timestamp):
+                # Reset daily loss for new day (preserve trailing drawdown)
+                from .day_boundary import reset_daily_loss_for_new_day
+                new_trading_date = day_boundary.get_trading_date(timestamp)
+                # Reset initial_balance to current equity for new day's daily loss calculation
+                reset_tracker = reset_daily_loss_for_new_day(
+                    self,
+                    new_trading_date,
+                    new_initial_balance=equity  # Use current equity as new day's starting balance
+                )
+                # Copy reset state to this instance (preserve high_water_mark and is_locked)
+                object.__setattr__(self, 'initial_balance', reset_tracker.initial_balance)
+                object.__setattr__(self, 'trading_date', reset_tracker.trading_date)
+                # Note: high_water_mark and is_locked are already preserved (they're copied from self to reset_tracker)
         
         # Update high-water mark
         if equity > self.high_water_mark:
