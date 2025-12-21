@@ -15,7 +15,7 @@ from .signal import Signal, SignalType
 from .order import Order, OrderStatus, OrderType
 from .fill import Fill
 from .position import Position
-from .engine import ExecutionEngine, ExecutionEngineError, RiskLimits
+from .engine import ExecutionEngine, ExecutionEngineError, RiskLimitExceededError, OrderRejectionError, RiskLimits
 from .paper_engine import PaperExecutionEngine
 
 __all__ = [
@@ -28,6 +28,8 @@ __all__ = [
     "Position",
     "ExecutionEngine",
     "ExecutionEngineError",
+    "RiskLimitExceededError",
+    "OrderRejectionError",
     "RiskLimits",
     "PaperExecutionEngine",
 ]

@@ -55,3 +55,36 @@ export const runsAPI = {
 // Health check
 export const healthCheck = () => request('/health')
 
+// Paper Trading API
+export const paperTradingAPI = {
+  createSession: (data) => request('/paper/sessions', {
+    method: 'POST',
+    body: data,
+  }),
+  submitSignal: (data) => request('/paper/orders', {
+    method: 'POST',
+    body: data,
+  }),
+  executeOrder: (orderId, data) => request(`/paper/orders/${encodeURIComponent(orderId)}/execute`, {
+    method: 'POST',
+    body: data,
+  }),
+  listOrders: (sessionId, params = {}) => {
+    const queryParams = new URLSearchParams({ session_id: sessionId, ...params }).toString()
+    return request(`/paper/orders?${queryParams}`)
+  },
+  getOrder: (orderId, sessionId) => request(`/paper/orders/${encodeURIComponent(orderId)}?session_id=${encodeURIComponent(sessionId)}`),
+  listFills: (sessionId, orderId = null) => {
+    const params = { session_id: sessionId }
+    if (orderId) params.order_id = orderId
+    const queryParams = new URLSearchParams(params).toString()
+    return request(`/paper/fills?${queryParams}`)
+  },
+  listPositions: (sessionId, instrument = null) => {
+    const params = { session_id: sessionId }
+    if (instrument) params.instrument = instrument
+    const queryParams = new URLSearchParams(params).toString()
+    return request(`/paper/positions?${queryParams}`)
+  },
+}
+

@@ -4,6 +4,7 @@ import Overview from './pages/Overview'
 import Experiments from './pages/Experiments'
 import Runs from './pages/Runs'
 import RunDetail from './pages/RunDetail'
+import PaperTrading from './pages/PaperTrading'
 import './App.css'
 
 function App() {
@@ -17,6 +18,7 @@ function App() {
               <Link to="/" className="nav-link">Overview</Link>
               <Link to="/experiments" className="nav-link">Experiments</Link>
               <Link to="/runs" className="nav-link">Runs</Link>
+              <Link to="/paper-trading" className="nav-link">Paper Trading</Link>
             </div>
           </div>
         </div>
@@ -28,6 +30,7 @@ function App() {
           <Route path="/experiments" element={<Experiments />} />
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:runId" element={<RunDetail />} />
+          <Route path="/paper-trading" element={<PaperTrading />} />
         </Routes>
       </main>
     </div>

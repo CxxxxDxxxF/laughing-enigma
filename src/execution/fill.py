@@ -4,7 +4,7 @@ A Fill represents what actually happened when an order was executed.
 Multiple Fills can satisfy a single Order (partial fills).
 """
 
-from typing import Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -80,4 +80,44 @@ class Fill:
             For SELL: net_value is what was received (minus fee)
         """
         return self.gross_value() - self.fee if self.side == "sell" else self.gross_value() + self.fee
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize fill to dictionary.
+        
+        Returns:
+            Dictionary representation suitable for JSON serialization
+        """
+        return {
+            "id": self.id,
+            "order_id": self.order_id,
+            "instrument": self.instrument,
+            "side": self.side,
+            "quantity": self.quantity,
+            "price": self.price,
+            "fee": self.fee,
+            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
+            "execution_id": self.execution_id,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Fill':
+        """Deserialize fill from dictionary.
+        
+        Args:
+            data: Dictionary representation (from to_dict)
+            
+        Returns:
+            Fill instance
+        """
+        return cls(
+            id=data["id"],
+            order_id=data["order_id"],
+            instrument=data["instrument"],
+            side=data["side"],
+            quantity=data["quantity"],
+            price=data["price"],
+            fee=data.get("fee", 0.0),
+            filled_at=datetime.fromisoformat(data["filled_at"]) if data.get("filled_at") else None,
+            execution_id=data.get("execution_id"),
+        )
 

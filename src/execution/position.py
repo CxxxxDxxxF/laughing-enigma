@@ -4,7 +4,7 @@ A Position represents the current state of holdings for an instrument.
 Positions are updated by Fills.
 """
 
-from typing import Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -174,5 +174,37 @@ class Position:
             cost_basis=new_cost_basis,
             realized_pnl=new_realized_pnl,
             updated_at=datetime.now()
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize position to dictionary.
+        
+        Returns:
+            Dictionary representation suitable for JSON serialization
+        """
+        return {
+            "instrument": self.instrument,
+            "quantity": self.quantity,
+            "cost_basis": self.cost_basis,
+            "realized_pnl": self.realized_pnl,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Position':
+        """Deserialize position from dictionary.
+        
+        Args:
+            data: Dictionary representation (from to_dict)
+            
+        Returns:
+            Position instance
+        """
+        return cls(
+            instrument=data["instrument"],
+            quantity=data["quantity"],
+            cost_basis=data["cost_basis"],
+            realized_pnl=data.get("realized_pnl", 0.0),
+            updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None,
         )
 

@@ -4,7 +4,7 @@ An Order represents a request to execute a trade. Orders go through
 a lifecycle: CREATED → ACCEPTED → FILLED/CANCELED.
 """
 
-from typing import Optional
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -128,5 +128,53 @@ class Order:
             OrderStatus.FILLED,
             OrderStatus.CANCELED,
             OrderStatus.REJECTED
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize order to dictionary.
+        
+        Returns:
+            Dictionary representation suitable for JSON serialization
+        """
+        return {
+            "id": self.id,
+            "signal_id": self.signal_id,
+            "instrument": self.instrument,
+            "order_type": self.order_type.value,
+            "side": self.side,
+            "quantity": self.quantity,
+            "price_limit": self.price_limit,
+            "status": self.status.value,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "accepted_at": self.accepted_at.isoformat() if self.accepted_at else None,
+            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
+            "canceled_at": self.canceled_at.isoformat() if self.canceled_at else None,
+            "rejection_reason": self.rejection_reason,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Order':
+        """Deserialize order from dictionary.
+        
+        Args:
+            data: Dictionary representation (from to_dict)
+            
+        Returns:
+            Order instance
+        """
+        return cls(
+            id=data["id"],
+            signal_id=data.get("signal_id"),
+            instrument=data["instrument"],
+            order_type=OrderType(data["order_type"]),
+            side=data["side"],
+            quantity=data["quantity"],
+            price_limit=data.get("price_limit"),
+            status=OrderStatus(data["status"]),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None,
+            accepted_at=datetime.fromisoformat(data["accepted_at"]) if data.get("accepted_at") else None,
+            filled_at=datetime.fromisoformat(data["filled_at"]) if data.get("filled_at") else None,
+            canceled_at=datetime.fromisoformat(data["canceled_at"]) if data.get("canceled_at") else None,
+            rejection_reason=data.get("rejection_reason"),
         )
 

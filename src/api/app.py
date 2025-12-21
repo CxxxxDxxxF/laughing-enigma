@@ -10,11 +10,15 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Query
 from pydantic import BaseModel, Field
 
 from ..core import Experiment, Run, RunStatus, Metrics, LocalArtifactStore, MetricsError
 from ..engines import SimpleResearchEngine, BacktestError
+from ..execution import (
+    PaperExecutionEngine, Signal, SignalType, Order, Fill, Position,
+    RiskLimits, ExecutionEngineError, OrderRejectionError
+)
 
 
 # Request/Response Models
@@ -101,6 +105,9 @@ class MetricsResponse(BaseModel):
 _experiment_registry: Dict[tuple[str, str], Experiment] = {}
 _artifact_store: Optional[LocalArtifactStore] = None
 _engine: Optional[SimpleResearchEngine] = None
+
+# Paper trading sessions (session_id -> PaperExecutionEngine)
+_paper_sessions: Dict[str, PaperExecutionEngine] = {}
 
 
 def get_artifact_store() -> LocalArtifactStore:
@@ -413,3 +420,486 @@ def list_artifacts(run_id: str) -> Dict[str, List[str]]:
 def health_check() -> Dict[str, str]:
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+# Paper Trading API Models
+class CreatePaperSessionRequest(BaseModel):
+    """Request model for creating a paper trading session."""
+    instrument: str = Field(..., description="Instrument to trade")
+    max_position_size: Optional[float] = Field(None, description="Max position size")
+    max_daily_loss: Optional[float] = Field(None, description="Max daily loss (negative number)")
+    max_leverage: float = Field(1.0, description="Max leverage")
+    allowed_instruments: Optional[List[str]] = Field(None, description="Allowed instruments")
+    fixed_fee: float = Field(0.0, description="Fixed fee per fill")
+
+
+class PaperSessionResponse(BaseModel):
+    """Response model for paper trading session."""
+    session_id: str
+    instrument: str
+    fixed_fee: float
+
+
+class SubmitSignalRequest(BaseModel):
+    """Request model for submitting a signal."""
+    session_id: str = Field(..., description="Paper trading session ID")
+    instrument: str = Field(..., description="Instrument identifier")
+    signal_type: str = Field(..., description="Signal type: buy, sell, or hold")
+    quantity: float = Field(..., description="Quantity")
+    timestamp: Optional[str] = Field(None, description="Signal timestamp (ISO format)")
+
+
+class OrderResponse(BaseModel):
+    """Response model for order data."""
+    id: str
+    signal_id: Optional[str]
+    instrument: str
+    order_type: str
+    side: str
+    quantity: float
+    price_limit: Optional[float]
+    status: str
+    created_at: str
+    accepted_at: Optional[str]
+    filled_at: Optional[str]
+    canceled_at: Optional[str]
+    rejection_reason: Optional[str]
+
+
+class ExecuteOrderRequest(BaseModel):
+    """Request model for executing an order."""
+    session_id: str = Field(..., description="Paper trading session ID")
+    current_price: float = Field(..., description="Current market price")
+    timestamp: Optional[str] = Field(None, description="Execution timestamp (ISO format)")
+
+
+class FillResponse(BaseModel):
+    """Response model for fill data."""
+    id: str
+    order_id: str
+    instrument: str
+    side: str
+    quantity: float
+    price: float
+    fee: float
+    filled_at: str
+    execution_id: Optional[str]
+
+
+class PositionResponse(BaseModel):
+    """Response model for position data."""
+    instrument: str
+    quantity: float
+    cost_basis: float
+    realized_pnl: float
+    updated_at: str
+
+
+# Paper Trading API Endpoints
+@app.post("/paper/sessions", response_model=PaperSessionResponse, status_code=status.HTTP_201_CREATED)
+def create_paper_session(request: CreatePaperSessionRequest) -> PaperSessionResponse:
+    """Create a new paper trading session.
+    
+    Args:
+        request: Session creation request
+        
+    Returns:
+        Created session data
+        
+    Raises:
+        HTTPException: If session creation fails
+    """
+    try:
+        # Create risk limits
+        risk_limits = RiskLimits(
+            max_position_size=request.max_position_size,
+            max_daily_loss=request.max_daily_loss,
+            max_leverage=request.max_leverage,
+            allowed_instruments=request.allowed_instruments
+        )
+        
+        # Create engine
+        artifact_store = get_artifact_store()
+        engine = PaperExecutionEngine(
+            instrument=request.instrument,
+            risk_limits=risk_limits,
+            fixed_fee=request.fixed_fee,
+            artifact_store=artifact_store
+        )
+        
+        # Persist session
+        engine.persist_session()
+        
+        # Store in memory
+        _paper_sessions[engine.session_id] = engine
+        
+        return PaperSessionResponse(
+            session_id=engine.session_id,
+            instrument=engine.instrument,
+            fixed_fee=engine.fixed_fee
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to create paper session: {e}"
+        )
+
+
+@app.post("/paper/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+def submit_paper_order(request: SubmitSignalRequest) -> OrderResponse:
+    """Submit a signal as an order in a paper trading session.
+    
+    Args:
+        request: Signal submission request
+        
+    Returns:
+        Created order data
+        
+    Raises:
+        HTTPException: If session not found or order submission fails
+    """
+    # Get or load session
+    engine = _paper_sessions.get(request.session_id)
+    if engine is None:
+        # Try to load from artifacts
+        try:
+            artifact_store = get_artifact_store()
+            engine = PaperExecutionEngine.load_session(request.session_id, artifact_store)
+            _paper_sessions[request.session_id] = engine
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Paper session {request.session_id} not found: {e}"
+            )
+    
+    try:
+        # Create signal
+        signal_type_map = {
+            "buy": SignalType.BUY,
+            "sell": SignalType.SELL,
+            "hold": SignalType.HOLD,
+        }
+        signal_type = signal_type_map.get(request.signal_type.lower())
+        if signal_type is None:
+            raise ValueError(f"Invalid signal_type: {request.signal_type}")
+        
+        signal_timestamp = datetime.now()
+        if request.timestamp:
+            signal_timestamp = datetime.fromisoformat(request.timestamp)
+        
+        signal = Signal(
+            timestamp=signal_timestamp,
+            instrument=request.instrument,
+            signal_type=signal_type,
+            quantity=request.quantity
+        )
+        
+        # Submit order
+        order = engine.submit_order(signal)
+        
+        return OrderResponse(
+            id=order.id,
+            signal_id=order.signal_id,
+            instrument=order.instrument,
+            order_type=order.order_type.value,
+            side=order.side,
+            quantity=order.quantity,
+            price_limit=order.price_limit,
+            status=order.status.value,
+            created_at=order.created_at.isoformat() if order.created_at else "",
+            accepted_at=order.accepted_at.isoformat() if order.accepted_at else None,
+            filled_at=order.filled_at.isoformat() if order.filled_at else None,
+            canceled_at=order.canceled_at.isoformat() if order.canceled_at else None,
+            rejection_reason=order.rejection_reason
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to submit order: {e}"
+        )
+
+
+@app.post("/paper/orders/{order_id}/execute", response_model=List[FillResponse], status_code=status.HTTP_200_OK)
+def execute_paper_order(
+    order_id: str,
+    request: ExecuteOrderRequest
+) -> List[FillResponse]:
+    """Execute an order at a given price and timestamp.
+    
+    Args:
+        order_id: Order identifier
+        request: Execution request with price and timestamp
+        
+    Returns:
+        List of fills (usually single fill for immediate execution)
+        
+    Raises:
+        HTTPException: If session not found, order not found, or execution fails
+    """
+    # Get or load session
+    engine = _paper_sessions.get(request.session_id)
+    if engine is None:
+        try:
+            artifact_store = get_artifact_store()
+            engine = PaperExecutionEngine.load_session(request.session_id, artifact_store)
+            _paper_sessions[request.session_id] = engine
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Paper session {request.session_id} not found: {e}"
+            )
+    
+    # Get order
+    order = engine.get_order(order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order {order_id} not found in session {request.session_id}"
+        )
+    
+    try:
+        # Execute order
+        execution_timestamp = None
+        if request.timestamp:
+            execution_timestamp = datetime.fromisoformat(request.timestamp)
+        
+        fills = engine.execute_order(order, request.current_price, execution_timestamp)
+        
+        return [
+            FillResponse(
+                id=fill.id,
+                order_id=fill.order_id,
+                instrument=fill.instrument,
+                side=fill.side,
+                quantity=fill.quantity,
+                price=fill.price,
+                fee=fill.fee,
+                filled_at=fill.filled_at.isoformat() if fill.filled_at else "",
+                execution_id=fill.execution_id
+            )
+            for fill in fills
+        ]
+        
+    except OrderRejectionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Order execution rejected: {e}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to execute order: {e}"
+        )
+
+
+@app.get("/paper/orders", response_model=List[OrderResponse])
+def list_paper_orders(
+    session_id: str = Query(..., description="Paper trading session ID"),
+    instrument: Optional[str] = Query(None, description="Filter by instrument"),
+    status: Optional[str] = Query(None, description="Filter by status")
+) -> List[OrderResponse]:
+    """List orders for a paper trading session.
+    
+    Args:
+        session_id: Paper trading session ID
+        instrument: Optional filter by instrument
+        status: Optional filter by status
+        
+    Returns:
+        List of orders
+        
+    Raises:
+        HTTPException: If session not found
+    """
+    # Get or load session
+    engine = _paper_sessions.get(session_id)
+    if engine is None:
+        try:
+            artifact_store = get_artifact_store()
+            engine = PaperExecutionEngine.load_session(session_id, artifact_store)
+            _paper_sessions[session_id] = engine
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Paper session {session_id} not found: {e}"
+            )
+    
+    orders = engine.list_orders(instrument=instrument, status=status)
+    
+    return [
+        OrderResponse(
+            id=order.id,
+            signal_id=order.signal_id,
+            instrument=order.instrument,
+            order_type=order.order_type.value,
+            side=order.side,
+            quantity=order.quantity,
+            price_limit=order.price_limit,
+            status=order.status.value,
+            created_at=order.created_at.isoformat() if order.created_at else "",
+            accepted_at=order.accepted_at.isoformat() if order.accepted_at else None,
+            filled_at=order.filled_at.isoformat() if order.filled_at else None,
+            canceled_at=order.canceled_at.isoformat() if order.canceled_at else None,
+            rejection_reason=order.rejection_reason
+        )
+        for order in orders
+    ]
+
+
+@app.get("/paper/orders/{order_id}", response_model=OrderResponse)
+def get_paper_order(
+    order_id: str,
+    session_id: str = Query(..., description="Paper trading session ID")
+) -> OrderResponse:
+    """Get a specific order.
+    
+    Args:
+        session_id: Paper trading session ID
+        order_id: Order identifier
+        
+    Returns:
+        Order data
+        
+    Raises:
+        HTTPException: If session or order not found
+    """
+    # Get or load session
+    engine = _paper_sessions.get(session_id)
+    if engine is None:
+        try:
+            artifact_store = get_artifact_store()
+            engine = PaperExecutionEngine.load_session(session_id, artifact_store)
+            _paper_sessions[session_id] = engine
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Paper session {session_id} not found: {e}"
+            )
+    
+    order = engine.get_order(order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order {order_id} not found in session {session_id}"
+        )
+    
+    return OrderResponse(
+        id=order.id,
+        signal_id=order.signal_id,
+        instrument=order.instrument,
+        order_type=order.order_type.value,
+        side=order.side,
+        quantity=order.quantity,
+        price_limit=order.price_limit,
+        status=order.status.value,
+        created_at=order.created_at.isoformat() if order.created_at else "",
+        accepted_at=order.accepted_at.isoformat() if order.accepted_at else None,
+        filled_at=order.filled_at.isoformat() if order.filled_at else None,
+        canceled_at=order.canceled_at.isoformat() if order.canceled_at else None,
+        rejection_reason=order.rejection_reason
+    )
+
+
+@app.get("/paper/fills", response_model=List[FillResponse])
+def list_paper_fills(
+    session_id: str = Query(..., description="Paper trading session ID"),
+    order_id: Optional[str] = Query(None, description="Filter by order ID")
+) -> List[FillResponse]:
+    """List fills for a paper trading session.
+    
+    Args:
+        session_id: Paper trading session ID
+        order_id: Optional filter by order ID
+        
+    Returns:
+        List of fills
+        
+    Raises:
+        HTTPException: If session not found
+    """
+    # Get or load session
+    engine = _paper_sessions.get(session_id)
+    if engine is None:
+        try:
+            artifact_store = get_artifact_store()
+            engine = PaperExecutionEngine.load_session(session_id, artifact_store)
+            _paper_sessions[session_id] = engine
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Paper session {session_id} not found: {e}"
+            )
+    
+    if order_id:
+        fills = engine.get_fills(order_id)
+    else:
+        # Get all fills
+        all_fills = []
+        for oid in engine.orders.keys():
+            all_fills.extend(engine.get_fills(oid))
+        fills = all_fills
+    
+    return [
+        FillResponse(
+            id=fill.id,
+            order_id=fill.order_id,
+            instrument=fill.instrument,
+            side=fill.side,
+            quantity=fill.quantity,
+            price=fill.price,
+            fee=fill.fee,
+            filled_at=fill.filled_at.isoformat() if fill.filled_at else "",
+            execution_id=fill.execution_id
+        )
+        for fill in fills
+    ]
+
+
+@app.get("/paper/positions", response_model=List[PositionResponse])
+def list_paper_positions(
+    session_id: str = Query(..., description="Paper trading session ID"),
+    instrument: Optional[str] = Query(None, description="Filter by instrument")
+) -> List[PositionResponse]:
+    """List positions for a paper trading session.
+    
+    Args:
+        session_id: Paper trading session ID
+        instrument: Optional filter by instrument (if None, returns all positions)
+        
+    Returns:
+        List of positions
+        
+    Raises:
+        HTTPException: If session not found
+    """
+    # Get or load session
+    engine = _paper_sessions.get(session_id)
+    if engine is None:
+        try:
+            artifact_store = get_artifact_store()
+            engine = PaperExecutionEngine.load_session(session_id, artifact_store)
+            _paper_sessions[session_id] = engine
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Paper session {session_id} not found: {e}"
+            )
+    
+    if instrument:
+        positions = [engine.get_position(instrument)]
+    else:
+        # Return all positions (including flat ones)
+        positions = list(engine.positions.values())
+    
+    return [
+        PositionResponse(
+            instrument=position.instrument,
+            quantity=position.quantity,
+            cost_basis=position.cost_basis,
+            realized_pnl=position.realized_pnl,
+            updated_at=position.updated_at.isoformat() if position.updated_at else ""
+        )
+        for position in positions
+    ]

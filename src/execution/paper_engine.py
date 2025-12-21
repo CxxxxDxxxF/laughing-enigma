@@ -4,6 +4,7 @@ This module provides a deterministic paper trading execution engine
 for single-instrument backtesting with market orders only.
 """
 
+import json
 import uuid
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -13,6 +14,13 @@ from .order import Order, OrderStatus, OrderType
 from .fill import Fill
 from .position import Position
 from .engine import ExecutionEngine, ExecutionEngineError, OrderRejectionError, RiskLimitExceededError, RiskLimits
+
+try:
+    from ..core.artifacts import ArtifactStore, ArtifactStoreError
+except ImportError:
+    # Allow import without core dependency for testing
+    ArtifactStore = None
+    ArtifactStoreError = Exception
 
 
 class PaperExecutionEngine(ExecutionEngine):
@@ -42,7 +50,9 @@ class PaperExecutionEngine(ExecutionEngine):
         self,
         instrument: str,
         risk_limits: Optional[RiskLimits] = None,
-        fixed_fee: float = 0.0
+        fixed_fee: float = 0.0,
+        artifact_store: Optional['ArtifactStore'] = None,
+        session_id: Optional[str] = None
     ):
         """Initialize paper execution engine.
         
@@ -50,6 +60,8 @@ class PaperExecutionEngine(ExecutionEngine):
             instrument: Single instrument identifier (enforced)
             risk_limits: Risk limits configuration (default: no limits)
             fixed_fee: Fixed fee per fill in dollars (default: 0.0)
+            artifact_store: Optional artifact store for persistence
+            session_id: Optional session identifier (defaults to generated UUID)
             
         Raises:
             ValueError: If instrument is empty or fixed_fee is negative
@@ -63,6 +75,8 @@ class PaperExecutionEngine(ExecutionEngine):
         self.instrument = instrument
         self.risk_limits = risk_limits or RiskLimits()
         self.fixed_fee = fixed_fee
+        self.artifact_store = artifact_store
+        self.session_id = session_id or str(uuid.uuid4())
         
         # State storage
         self.orders: Dict[str, Order] = {}
@@ -238,6 +252,10 @@ class PaperExecutionEngine(ExecutionEngine):
         self.orders[order_id] = order
         self.fills[order_id] = []  # Initialize fills list
         
+        # Persist if artifact store is configured
+        if self.artifact_store:
+            self.persist_session()
+        
         return order
     
     def execute_order(self, order: Order, current_price: float, timestamp: Optional[datetime] = None) -> List[Fill]:
@@ -351,6 +369,10 @@ class PaperExecutionEngine(ExecutionEngine):
         )
         self.orders[order.id] = filled_order
         
+        # Persist if artifact store is configured
+        if self.artifact_store:
+            self.persist_session()
+        
         return [fill]
     
     def cancel_order(self, order_id: str) -> Order:
@@ -392,6 +414,11 @@ class PaperExecutionEngine(ExecutionEngine):
         )
         
         self.orders[order_id] = canceled_order
+        
+        # Persist if artifact store is configured
+        if self.artifact_store:
+            self.persist_session()
+        
         return canceled_order
     
     def get_position(self, instrument: str) -> Position:
@@ -466,4 +493,138 @@ class PaperExecutionEngine(ExecutionEngine):
         self.positions.clear()
         self.daily_start_value = None
         self.daily_start_date = None
+    
+    def persist_session(self) -> None:
+        """Persist session state to artifact store.
+        
+        Stores:
+        - orders.json: All orders
+        - fills.json: All fills (by order_id)
+        - positions.json: All positions
+        - risk_limits.json: Risk limits configuration
+        - session_metadata.json: Session metadata
+        
+        Raises:
+            ExecutionEngineError: If artifact_store is None or persistence fails
+        """
+        if self.artifact_store is None:
+            raise ExecutionEngineError("Cannot persist session: artifact_store is None")
+        
+        try:
+            # Store orders
+            orders_data = [order.to_dict() for order in self.orders.values()]
+            orders_json = json.dumps(orders_data, indent=2).encode('utf-8')
+            self.artifact_store.store(self.session_id, "orders.json", orders_json)
+            
+            # Store fills (flatten list of lists)
+            all_fills = []
+            for order_id, fill_list in self.fills.items():
+                all_fills.extend([fill.to_dict() for fill in fill_list])
+            fills_json = json.dumps(all_fills, indent=2).encode('utf-8')
+            self.artifact_store.store(self.session_id, "fills.json", fills_json)
+            
+            # Store positions
+            positions_data = [pos.to_dict() for pos in self.positions.values()]
+            positions_json = json.dumps(positions_data, indent=2).encode('utf-8')
+            self.artifact_store.store(self.session_id, "positions.json", positions_json)
+            
+            # Store risk limits
+            risk_limits_data = {
+                "max_position_size": self.risk_limits.max_position_size,
+                "max_daily_loss": self.risk_limits.max_daily_loss,
+                "max_leverage": self.risk_limits.max_leverage,
+                "allowed_instruments": self.risk_limits.allowed_instruments,
+            }
+            risk_limits_json = json.dumps(risk_limits_data, indent=2).encode('utf-8')
+            self.artifact_store.store(self.session_id, "risk_limits.json", risk_limits_json)
+            
+            # Store session metadata
+            metadata = {
+                "session_id": self.session_id,
+                "instrument": self.instrument,
+                "fixed_fee": self.fixed_fee,
+                "created_at": datetime.now().isoformat(),
+            }
+            metadata_json = json.dumps(metadata, indent=2).encode('utf-8')
+            self.artifact_store.store(self.session_id, "session_metadata.json", metadata_json)
+            
+        except Exception as e:
+            raise ExecutionEngineError(f"Failed to persist session: {e}") from e
+    
+    @classmethod
+    def load_session(
+        cls,
+        session_id: str,
+        artifact_store: 'ArtifactStore'
+    ) -> 'PaperExecutionEngine':
+        """Load session from artifact store.
+        
+        Args:
+            session_id: Session identifier
+            artifact_store: Artifact store to load from
+            
+        Returns:
+            PaperExecutionEngine with loaded state
+            
+        Raises:
+            ExecutionEngineError: If session cannot be loaded
+        """
+        try:
+            # Load session metadata
+            metadata_data = artifact_store.retrieve(session_id, "session_metadata.json")
+            if metadata_data is None:
+                raise ExecutionEngineError(f"Session {session_id} not found")
+            
+            metadata = json.loads(metadata_data.decode('utf-8'))
+            instrument = metadata["instrument"]
+            fixed_fee = metadata.get("fixed_fee", 0.0)
+            
+            # Load risk limits
+            risk_limits_data = artifact_store.retrieve(session_id, "risk_limits.json")
+            risk_limits = None
+            if risk_limits_data:
+                rl_dict = json.loads(risk_limits_data.decode('utf-8'))
+                risk_limits = RiskLimits(
+                    max_position_size=rl_dict.get("max_position_size"),
+                    max_daily_loss=rl_dict.get("max_daily_loss"),
+                    max_leverage=rl_dict.get("max_leverage", 1.0),
+                    allowed_instruments=rl_dict.get("allowed_instruments"),
+                )
+            
+            # Create engine
+            engine = cls(
+                instrument=instrument,
+                risk_limits=risk_limits,
+                fixed_fee=fixed_fee,
+                artifact_store=artifact_store,
+                session_id=session_id
+            )
+            
+            # Load orders
+            orders_data = artifact_store.retrieve(session_id, "orders.json")
+            if orders_data:
+                orders_list = json.loads(orders_data.decode('utf-8'))
+                engine.orders = {order_dict["id"]: Order.from_dict(order_dict) for order_dict in orders_list}
+            
+            # Load fills
+            fills_data = artifact_store.retrieve(session_id, "fills.json")
+            if fills_data:
+                fills_list = json.loads(fills_data.decode('utf-8'))
+                engine.fills = {}
+                for fill_dict in fills_list:
+                    fill = Fill.from_dict(fill_dict)
+                    if fill.order_id not in engine.fills:
+                        engine.fills[fill.order_id] = []
+                    engine.fills[fill.order_id].append(fill)
+            
+            # Load positions
+            positions_data = artifact_store.retrieve(session_id, "positions.json")
+            if positions_data:
+                positions_list = json.loads(positions_data.decode('utf-8'))
+                engine.positions = {pos_dict["instrument"]: Position.from_dict(pos_dict) for pos_dict in positions_list}
+            
+            return engine
+            
+        except Exception as e:
+            raise ExecutionEngineError(f"Failed to load session {session_id}: {e}") from e
 
