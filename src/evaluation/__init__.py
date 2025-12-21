@@ -12,6 +12,12 @@ from .evaluator import (
     compare_strategies,
     EvaluationError,
 )
+from .batch import (
+    BatchEvaluationConfig,
+    StrategyConfig,
+    run_batch_evaluation,
+    BatchEvaluationError,
+)
 
 __all__ = [
     "StrategyEvaluation",
@@ -20,5 +26,9 @@ __all__ = [
     "evaluate_strategy",
     "compare_strategies",
     "EvaluationError",
+    "BatchEvaluationConfig",
+    "StrategyConfig",
+    "run_batch_evaluation",
+    "BatchEvaluationError",
 ]
 
