@@ -41,6 +41,7 @@ class CurrentPortfolioState:
         strategy_allocations: Dictionary mapping strategy_id -> current capital
         total_capital: Total capital in portfolio
         timestamp: Timestamp of this state snapshot
+        drawdown_tracker: Optional drawdown tracker for Topstep-style rules
         
     Note:
         If strategy_id is not in strategy_allocations, current allocation is 0.
@@ -49,6 +50,7 @@ class CurrentPortfolioState:
     strategy_allocations: Dict[str, float]
     total_capital: float
     timestamp: datetime
+    drawdown_tracker: Optional['DrawdownTracker'] = None
     
     def get_allocation(self, strategy_id: str) -> float:
         """Get current allocation for a strategy.
@@ -63,11 +65,14 @@ class CurrentPortfolioState:
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
-        return {
+        result = {
             "strategy_allocations": self.strategy_allocations,
             "total_capital": self.total_capital,
             "timestamp": self.timestamp.isoformat(),
         }
+        if self.drawdown_tracker is not None:
+            result["drawdown_tracker"] = self.drawdown_tracker.to_dict()
+        return result
 
 
 @dataclass

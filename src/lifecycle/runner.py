@@ -18,7 +18,7 @@ Determinism guarantees:
 import json
 import sys
 import argparse
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +47,10 @@ from ..rebalance.executor import (
 from ..engines.simple import SimpleResearchEngine
 from ..core.artifacts import ArtifactStore, LocalArtifactStore
 from ..execution import PaperExecutionEngine
+from .state_store import PortfolioStateStore, LocalPortfolioStateStore
+from .cadence import CycleCadenceConfig, check_cadence
+from .guardrails import GuardrailsConfig, check_allocation_guardrails, check_rebalance_guardrails, check_execution_guardrails
+from ..rules import Ruleset, RulesViolation, RulesViolationSeverity
 
 
 class CycleError(Exception):
@@ -62,6 +66,7 @@ class PortfolioCycleConfig:
     evaluation → allocation → rebalance → execution
     
     Attributes:
+        portfolio_id: Portfolio identifier (required for stateful operation)
         evaluation_config: Batch evaluation configuration
         allocation_config: Capital allocation configuration
         rebalance_config: Rebalance planning configuration
@@ -69,15 +74,20 @@ class PortfolioCycleConfig:
             - price_by_strategy_or_instrument: Dict[str, float] - prices for execution
             - rounding_method: str - rounding method ("floor", "round", "ceil")
             - min_quantity: float - minimum quantity
-        current_state: Current portfolio state (None = assume flat/empty)
+        cadence_config: Optional cadence configuration (None = no cadence check)
+        guardrails_config: Optional guardrails configuration (None = no guardrails)
         cycle_id: Optional cycle identifier (auto-generated if not provided)
     """
     
+    portfolio_id: str
     evaluation_config: BatchEvaluationConfig
     allocation_config: AllocationConfig
     rebalance_config: RebalanceConfig
     execution_config: Dict[str, Any]
-    current_state: Optional[CurrentPortfolioState] = None
+    cadence_config: Optional[CycleCadenceConfig] = None
+    guardrails_config: Optional[GuardrailsConfig] = None
+    ruleset_type: Optional[str] = None  # "topstep" or None
+    ruleset_config: Optional[Dict[str, Any]] = None
     cycle_id: Optional[str] = None
     
     @classmethod
@@ -121,22 +131,44 @@ class PortfolioCycleConfig:
                 allow_partial_rebalance=rebalance_data.get("allow_partial_rebalance", True),
             )
             
-            # Current state
-            current_state = None
-            if "current_state" in data and data["current_state"]:
-                state_data = data["current_state"]
-                current_state = CurrentPortfolioState(
-                    strategy_allocations=state_data["strategy_allocations"],
-                    total_capital=state_data["total_capital"],
-                    timestamp=datetime.fromisoformat(state_data["timestamp"]),
+            # Cadence config
+            cadence_config = None
+            if "cadence_config" in data and data["cadence_config"]:
+                from .cadence import CycleCadenceConfig
+                cad_data = data["cadence_config"]
+                cadence_config = CycleCadenceConfig(
+                    frequency=cad_data.get("frequency", "manual"),
+                    min_seconds_between_cycles=cad_data.get("min_seconds_between_cycles"),
+                    timezone=cad_data.get("timezone", "UTC"),
                 )
             
+            # Guardrails config
+            guardrails_config = None
+            if "guardrails_config" in data and data["guardrails_config"]:
+                from .guardrails import GuardrailsConfig
+                guard_data = data["guardrails_config"]
+                guardrails_config = GuardrailsConfig(
+                    max_turnover_pct_per_cycle=guard_data.get("max_turnover_pct_per_cycle", 1.0),
+                    max_failed_intents=guard_data.get("max_failed_intents"),
+                    min_execution_success_rate=guard_data.get("min_execution_success_rate", 0.0),
+                    max_single_strategy_allocation_fraction=guard_data.get("max_single_strategy_allocation_fraction", 1.0),
+                    halt_on_any_error=guard_data.get("halt_on_any_error", False),
+                )
+            
+            # Ruleset config
+            ruleset_type = data.get("ruleset_type")
+            ruleset_config = data.get("ruleset_config")
+            
             return cls(
+                portfolio_id=data["portfolio_id"],
                 evaluation_config=eval_config,
                 allocation_config=alloc_config,
                 rebalance_config=rebalance_config,
                 execution_config=data["execution_config"],
-                current_state=current_state,
+                cadence_config=cadence_config,
+                guardrails_config=guardrails_config,
+                ruleset_type=ruleset_type,
+                ruleset_config=ruleset_config,
                 cycle_id=data.get("cycle_id"),
             )
         except KeyError as e:
@@ -188,8 +220,22 @@ class PortfolioCycleConfig:
                 "min_trade_size": self.rebalance_config.min_trade_size,
                 "allow_partial_rebalance": self.rebalance_config.allow_partial_rebalance,
             },
+            "portfolio_id": self.portfolio_id,
             "execution_config": self.execution_config,
-            "current_state": self.current_state.to_dict() if self.current_state else None,
+            "cadence_config": {
+                "frequency": self.cadence_config.frequency,
+                "min_seconds_between_cycles": self.cadence_config.min_seconds_between_cycles,
+                "timezone": self.cadence_config.timezone,
+            } if self.cadence_config else None,
+            "guardrails_config": {
+                "max_turnover_pct_per_cycle": self.guardrails_config.max_turnover_pct_per_cycle,
+                "max_failed_intents": self.guardrails_config.max_failed_intents,
+                "min_execution_success_rate": self.guardrails_config.min_execution_success_rate,
+                "max_single_strategy_allocation_fraction": self.guardrails_config.max_single_strategy_allocation_fraction,
+                "halt_on_any_error": self.guardrails_config.halt_on_any_error,
+            } if self.guardrails_config else None,
+            "ruleset_type": self.ruleset_type,
+            "ruleset_config": self.ruleset_config,
             "cycle_id": self.cycle_id,
         }
 
@@ -201,31 +247,52 @@ class CycleResult:
     Attributes:
         cycle_id: Unique identifier for this cycle
         cycle_timestamp: When cycle was executed
-        evaluation_id: ID of evaluation result
-        allocation_id: ID of allocation result
-        rebalance_plan_id: ID of rebalance plan
-        rebalance_execution_id: ID of rebalance execution
+        portfolio_id: Portfolio identifier
+        evaluation_id: ID of evaluation result (None if skipped)
+        allocation_id: ID of allocation result (None if skipped)
+        rebalance_plan_id: ID of rebalance plan (None if skipped)
+        rebalance_execution_id: ID of rebalance execution (None if skipped)
+        state_before_id: ID of portfolio state before cycle (None if no previous state)
+        state_after_id: ID of portfolio state after cycle (None if skipped/halted)
         summary: Summary metrics across the cycle
+        status: Cycle status ("completed", "skipped", "halted")
+        skip_reason: Reason if status is "skipped" or "halted"
     """
     
     cycle_id: str
     cycle_timestamp: datetime
-    evaluation_id: str
-    allocation_id: str
-    rebalance_plan_id: str
-    rebalance_execution_id: str
+    portfolio_id: str
+    evaluation_id: Optional[str]
+    allocation_id: Optional[str]
+    rebalance_plan_id: Optional[str]
+    rebalance_execution_id: Optional[str]
+    state_before_id: Optional[str]
+    state_after_id: Optional[str]
     summary: Dict[str, Any]
+    status: str  # "completed", "skipped", "halted"
+    skip_reason: Optional[str] = None
+    rules_violations: List[Dict[str, Any]] = None  # List of RulesViolation dicts
+    ruleset_type: Optional[str] = None
+    ruleset_config: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
         return {
             "cycle_id": self.cycle_id,
             "cycle_timestamp": self.cycle_timestamp.isoformat(),
+            "portfolio_id": self.portfolio_id,
             "evaluation_id": self.evaluation_id,
             "allocation_id": self.allocation_id,
             "rebalance_plan_id": self.rebalance_plan_id,
             "rebalance_execution_id": self.rebalance_execution_id,
+            "state_before_id": self.state_before_id,
+            "state_after_id": self.state_after_id,
             "summary": self.summary,
+            "status": self.status,
+            "skip_reason": self.skip_reason,
+            "rules_violations": self.rules_violations or [],
+            "ruleset_type": self.ruleset_type,
+            "ruleset_config": self.ruleset_config,
         }
 
 
@@ -234,15 +301,19 @@ def run_portfolio_cycle(
     research_engine: SimpleResearchEngine,
     artifact_store: ArtifactStore,
     execution_engine_factory: Callable[[], PaperExecutionEngine],
+    state_store: Optional[PortfolioStateStore] = None,
     cycle_id: Optional[str] = None
 ) -> CycleResult:
     """Run a complete portfolio lifecycle cycle.
     
     Orchestrates:
-    1. Batch evaluation of strategies
-    2. Capital allocation across top strategies
-    3. Rebalance planning from current state to targets
-    4. Rebalance execution through paper engine
+    1. Load current portfolio state (if state_store provided)
+    2. Check cadence (skip if too soon)
+    3. Batch evaluation of strategies
+    4. Capital allocation across top strategies (with guardrails)
+    5. Rebalance planning from current state to targets (with guardrails)
+    6. Rebalance execution through paper engine (with guardrails)
+    7. Update portfolio state (if state_store provided)
     
     Determinism guarantees:
     - Same configs + same data → same cycle result
@@ -255,6 +326,7 @@ def run_portfolio_cycle(
         artifact_store: Artifact store for persistence
         execution_engine_factory: Factory function that creates PaperExecutionEngine
                                  (must create isolated sessions)
+        state_store: Optional portfolio state store (for stateful operation)
         cycle_id: Optional cycle identifier (auto-generated if not provided)
         
     Returns:
@@ -266,19 +338,86 @@ def run_portfolio_cycle(
     Example:
         >>> def create_engine():
         ...     return PaperExecutionEngine(instrument="AAPL", artifact_store=store)
+        >>> state_store = LocalPortfolioStateStore(artifact_store)
         >>> result = run_portfolio_cycle(
         ...     config=cycle_config,
         ...     research_engine=engine,
         ...     artifact_store=store,
-        ...     execution_engine_factory=create_engine
+        ...     execution_engine_factory=create_engine,
+        ...     state_store=state_store
         ... )
-        >>> print(f"Cycle {result.cycle_id} completed")
-        >>> print(f"Top strategy: {result.summary['top_strategy_id']}")
+        >>> print(f"Cycle {result.cycle_id} status: {result.status}")
     """
     if cycle_id is None:
         cycle_id = config.cycle_id or f"cycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
+    cycle_timestamp = datetime.now()
+    state_before_id = None
+    state_after_id = None
+    rules_violations: List[RulesViolation] = []
+    ruleset: Optional[Ruleset] = None
+    
     try:
+        # Step 0: Load current state (if state_store provided)
+        current_state = None
+        if state_store:
+            current_state = state_store.load_latest_state(config.portfolio_id)
+            if current_state:
+                # Save snapshot of state before cycle with unique ID
+                state_before_id = state_store.save_state(
+                    config.portfolio_id,
+                    CurrentPortfolioState(
+                        strategy_allocations=current_state.strategy_allocations,
+                        total_capital=current_state.total_capital,
+                        timestamp=current_state.timestamp  # Preserve original state timestamp
+                    ),
+                    state_id=f"{cycle_id}_before"  # Use cycle_id prefix for unique ID
+                )
+        
+        # Step 0.5: Check cadence (if configured)
+        if config.cadence_config:
+            # Load last cycle timestamp (from last cycle result if available)
+            # For simplicity, check if we have a recent state timestamp
+            last_cycle_timestamp = None
+            if current_state:
+                last_cycle_timestamp = current_state.timestamp
+            
+            should_run, skip_reason = check_cadence(
+                config.cadence_config,
+                last_cycle_timestamp,
+                cycle_timestamp
+            )
+            
+            if not should_run:
+                # Skip cycle
+                return CycleResult(
+                    cycle_id=cycle_id,
+                    cycle_timestamp=cycle_timestamp,
+                    portfolio_id=config.portfolio_id,
+                    evaluation_id=None,
+                    allocation_id=None,
+                    rebalance_plan_id=None,
+                    rebalance_execution_id=None,
+                    state_before_id=state_before_id,
+                    state_after_id=None,
+                    summary={},
+                    status="skipped",
+                    skip_reason=skip_reason,
+                    rules_violations=[],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                )
+        
+        # Initialize current state if not loaded
+        if current_state is None:
+            current_state = CurrentPortfolioState(
+                strategy_allocations={},
+                total_capital=config.allocation_config.total_capital,
+                timestamp=cycle_timestamp
+            )
+            if state_store:
+                state_before_id = state_store.save_state(config.portfolio_id, current_state)
+        
         # Step 1: Batch evaluation
         evaluation = run_batch_evaluation(
             config=config.evaluation_config,
@@ -293,39 +432,138 @@ def run_portfolio_cycle(
             evaluation=evaluation,
             config=config.allocation_config
         )
+        
+        # Check allocation guardrails
+        if config.guardrails_config:
+            alloc_list = [{"allocation_fraction": a.allocation_fraction} for a in allocation_result.allocations]
+            passes, violation = check_allocation_guardrails(
+                config.guardrails_config,
+                alloc_list,
+                allocation_result.total_capital
+            )
+            if not passes:
+                # Halt cycle
+                from ..allocation.allocator import persist_allocation
+                allocation_id = persist_allocation(allocation_result, artifact_store)
+                return CycleResult(
+                    cycle_id=cycle_id,
+                    cycle_timestamp=cycle_timestamp,
+                    portfolio_id=config.portfolio_id,
+                    evaluation_id=evaluation_id,
+                    allocation_id=allocation_id,
+                    rebalance_plan_id=None,
+                    rebalance_execution_id=None,
+                    state_before_id=state_before_id,
+                    state_after_id=None,
+                    summary={
+                        "evaluation_summary": evaluation.summary,
+                        "allocation_summary": {
+                            "total_capital": allocation_result.total_capital,
+                            "allocated_capital": allocation_result.allocated_capital,
+                            "num_strategies": len(allocation_result.allocations),
+                        },
+                    },
+                    status="halted",
+                    skip_reason=f"Allocation guardrail violation: {violation}",
+                    rules_violations=[],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                )
+        
         from ..allocation.allocator import persist_allocation
         allocation_id = persist_allocation(allocation_result, artifact_store)
         
-        # Step 3: Determine current state
-        if config.current_state is None:
-            # Assume flat/empty portfolio
-            current_state = CurrentPortfolioState(
-                strategy_allocations={},
-                total_capital=config.allocation_config.total_capital,
-                timestamp=datetime.now()
-            )
-        else:
-            current_state = config.current_state
-        
-        # Step 4: Rebalance planning
+        # Step 3: Rebalance planning
         rebalance_plan = plan_rebalance(
             allocation_result=allocation_result,
             current_state=current_state,
             config=config.rebalance_config
         )
+        
+        # Check rebalance guardrails
+        if config.guardrails_config:
+            passes, violation = check_rebalance_guardrails(
+                config.guardrails_config,
+                rebalance_plan.metrics.get("total_turnover", 0.0),
+                current_state.total_capital
+            )
+            if not passes:
+                # Halt cycle
+                from ..rebalance.planner import persist_rebalance_plan
+                rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
+                return CycleResult(
+                    cycle_id=cycle_id,
+                    cycle_timestamp=cycle_timestamp,
+                    portfolio_id=config.portfolio_id,
+                    evaluation_id=evaluation_id,
+                    allocation_id=allocation_id,
+                    rebalance_plan_id=rebalance_plan_id,
+                    rebalance_execution_id=None,
+                    state_before_id=state_before_id,
+                    state_after_id=None,
+                    summary={
+                        "evaluation_summary": evaluation.summary,
+                        "allocation_summary": {
+                            "total_capital": allocation_result.total_capital,
+                            "allocated_capital": allocation_result.allocated_capital,
+                            "num_strategies": len(allocation_result.allocations),
+                        },
+                        "rebalance_summary": rebalance_plan.metrics,
+                    },
+                    status="halted",
+                    skip_reason=f"Rebalance guardrail violation: {violation}",
+                    rules_violations=[],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                )
+        
         from ..rebalance.planner import persist_rebalance_plan
         rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
         
-        # Step 5: Rebalance execution
-        # Create execution engine for rebalance
+        # Step 3.5: Validate rebalance plan against ruleset
+        if config.ruleset_type == "topstep" and config.ruleset_config:
+            from ..rules import TopstepRulesConfig, TopstepRuleset
+            ruleset_config = TopstepRulesConfig(**config.ruleset_config)
+            ruleset = TopstepRuleset(ruleset_config)
+            plan_violations = ruleset.validate_plan(rebalance_plan, current_state)
+            rules_violations.extend(plan_violations)
+            
+            # Check for HALT violations
+            halt_violations = [v for v in plan_violations if v.severity == RulesViolationSeverity.HALT]
+            if halt_violations:
+                return CycleResult(
+                    cycle_id=cycle_id,
+                    cycle_timestamp=cycle_timestamp,
+                    portfolio_id=config.portfolio_id,
+                    evaluation_id=evaluation_id,
+                    allocation_id=allocation_id,
+                    rebalance_plan_id=rebalance_plan_id,
+                    rebalance_execution_id=None,
+                    state_before_id=state_before_id,
+                    state_after_id=None,
+                    summary={
+                        "evaluation_summary": evaluation.summary,
+                        "allocation_summary": {
+                            "total_capital": allocation_result.total_capital,
+                            "allocated_capital": allocation_result.allocated_capital,
+                            "num_strategies": len(allocation_result.allocations),
+                        },
+                        "rebalance_summary": rebalance_plan.metrics,
+                    },
+                    status="halted",
+                    skip_reason=f"Ruleset violation: {halt_violations[0].message}",
+                    rules_violations=[v.to_dict() for v in rules_violations],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                )
+        
+        # Step 4: Rebalance execution
         execution_engine = execution_engine_factory()
         
-        # Get prices from execution config
         price_by_strategy_or_instrument = config.execution_config.get(
             "price_by_strategy_or_instrument", {}
         )
         
-        # Create mapper
         mapper = RebalanceSignalMapper(
             rounding_method=config.execution_config.get("rounding_method", "floor"),
             min_quantity=config.execution_config.get("min_quantity", 0.0)
@@ -337,8 +575,186 @@ def run_portfolio_cycle(
             price_by_strategy_or_instrument=price_by_strategy_or_instrument,
             mapper=mapper
         )
+        
+        # Check execution guardrails
+        if config.guardrails_config:
+            passes, violation = check_execution_guardrails(
+                config.guardrails_config,
+                execution_result.execution_summary["successful_intents"],
+                execution_result.execution_summary["failed_intents"],
+                execution_result.execution_summary["total_intents"]
+            )
+            if not passes:
+                # Halt cycle (but execution already happened)
+                from ..rebalance.executor import persist_rebalance_execution
+                rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+                return CycleResult(
+                    cycle_id=cycle_id,
+                    cycle_timestamp=cycle_timestamp,
+                    portfolio_id=config.portfolio_id,
+                    evaluation_id=evaluation_id,
+                    allocation_id=allocation_id,
+                    rebalance_plan_id=rebalance_plan_id,
+                    rebalance_execution_id=rebalance_execution_id,
+                    state_before_id=state_before_id,
+                    state_after_id=None,  # Don't update state if halted
+                    summary={
+                        "evaluation_summary": evaluation.summary,
+                        "allocation_summary": {
+                            "total_capital": allocation_result.total_capital,
+                            "allocated_capital": allocation_result.allocated_capital,
+                            "num_strategies": len(allocation_result.allocations),
+                        },
+                        "rebalance_summary": rebalance_plan.metrics,
+                        "execution_summary": execution_result.execution_summary,
+                    },
+                    status="halted",
+                    skip_reason=f"Execution guardrail violation: {violation}",
+                    rules_violations=[],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                )
+        
         from ..rebalance.executor import persist_rebalance_execution
         rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+        
+        # Step 4.5: Validate execution against ruleset
+        if ruleset:
+            # Get current prices from execution config for equity calculation
+            price_by_strategy_or_instrument = config.execution_config.get(
+                "price_by_strategy_or_instrument", {}
+            )
+            # Convert to instrument -> price mapping (assumes single instrument per engine)
+            current_prices = {}
+            if execution_engine and hasattr(execution_engine, 'instrument'):
+                instrument = execution_engine.instrument
+                # Try instrument key first, then try strategy keys
+                price = price_by_strategy_or_instrument.get(instrument)
+                if price is None:
+                    # Try first strategy ID as fallback
+                    for key, val in price_by_strategy_or_instrument.items():
+                        price = val
+                        break
+                if price is not None:
+                    current_prices[instrument] = price
+            
+            exec_violations = ruleset.validate_execution(
+                execution_result, current_state, execution_engine=execution_engine, current_prices=current_prices
+            )
+            rules_violations.extend(exec_violations)
+            
+            # Check for HALT violations
+            halt_violations = [v for v in exec_violations if v.severity == RulesViolationSeverity.HALT]
+            if halt_violations:
+                return CycleResult(
+                    cycle_id=cycle_id,
+                    cycle_timestamp=cycle_timestamp,
+                    portfolio_id=config.portfolio_id,
+                    evaluation_id=evaluation_id,
+                    allocation_id=allocation_id,
+                    rebalance_plan_id=rebalance_plan_id,
+                    rebalance_execution_id=rebalance_execution_id,
+                    state_before_id=state_before_id,
+                    state_after_id=None,  # Don't update state if halted
+                    summary={
+                        "evaluation_summary": evaluation.summary,
+                        "allocation_summary": {
+                            "total_capital": allocation_result.total_capital,
+                            "allocated_capital": allocation_result.allocated_capital,
+                            "num_strategies": len(allocation_result.allocations),
+                        },
+                        "rebalance_summary": rebalance_plan.metrics,
+                        "execution_summary": execution_result.execution_summary,
+                    },
+                    status="halted",
+                    skip_reason=f"Ruleset violation: {halt_violations[0].message}",
+                    rules_violations=[v.to_dict() for v in rules_violations],
+                    ruleset_type=config.ruleset_type,
+                    ruleset_config=config.ruleset_config,
+                )
+        
+        # Step 5: Update portfolio state
+        if state_store:
+            # Compute new state from target allocations (since execution succeeded)
+            # Use the allocation_result as the source of truth for target allocations
+            new_allocations = {}
+            for alloc in allocation_result.allocations:
+                strategy_id = alloc.strategy_id
+                new_allocations[strategy_id] = alloc.allocated_capital
+            
+            # Preserve or update drawdown tracker from execution validation
+            drawdown_tracker = None
+            if ruleset and execution_engine:
+                # Get updated drawdown tracker from execution validation
+                # It was updated during validate_execution if Topstep ruleset was used
+                # For now, we'll initialize a new one if needed, but ideally it should be
+                # passed back from validate_execution or stored in execution_result
+                # This is a limitation - we need to recompute equity to update tracker
+                from ..rules.drawdown import DrawdownTracker, calculate_portfolio_equity
+                from datetime import date as date_class
+                
+                # Get current prices
+                price_by_strategy_or_instrument = config.execution_config.get(
+                    "price_by_strategy_or_instrument", {}
+                )
+                current_prices = {}
+                if hasattr(execution_engine, 'instrument'):
+                    instrument = execution_engine.instrument
+                    price = price_by_strategy_or_instrument.get(instrument)
+                    if price is None:
+                        for key, val in price_by_strategy_or_instrument.items():
+                            price = val
+                            break
+                    if price is not None:
+                        current_prices[instrument] = price
+                
+                # Get positions
+                positions = execution_engine.positions if hasattr(execution_engine, 'positions') else {}
+                
+                # Calculate equity
+                total_realized_pnl = sum(p.realized_pnl for p in positions.values())
+                initial_cash = allocation_result.total_capital
+                
+                if current_prices:
+                    equity, unrealized_pnl = calculate_portfolio_equity(
+                        initial_cash=initial_cash,
+                        positions=positions,
+                        current_prices=current_prices,
+                        realized_pnl=total_realized_pnl
+                    )
+                else:
+                    equity = initial_cash + total_realized_pnl
+                    unrealized_pnl = 0.0
+                
+                # Get or create drawdown tracker
+                if current_state.drawdown_tracker:
+                    drawdown_tracker = current_state.drawdown_tracker
+                else:
+                    drawdown_tracker = DrawdownTracker(
+                        initial_balance=initial_cash,
+                        trading_date=date_class.today()
+                    )
+                
+                # Update tracker
+                drawdown_tracker.update(
+                    equity=equity,
+                    realized_pnl=total_realized_pnl,
+                    unrealized_pnl=unrealized_pnl,
+                    timestamp=cycle_timestamp
+                )
+            
+            # Create new state with target allocations and drawdown tracker
+            new_state = CurrentPortfolioState(
+                strategy_allocations=new_allocations,
+                total_capital=allocation_result.total_capital,
+                timestamp=cycle_timestamp,
+                drawdown_tracker=drawdown_tracker
+            )
+            state_after_id = state_store.save_state(
+                config.portfolio_id,
+                new_state,
+                state_id=f"{cycle_id}_after"  # Use cycle_id prefix for unique ID
+            )
         
         # Step 6: Compute cycle summary
         summary = {
@@ -355,12 +771,20 @@ def run_portfolio_cycle(
         
         return CycleResult(
             cycle_id=cycle_id,
-            cycle_timestamp=datetime.now(),
+            cycle_timestamp=cycle_timestamp,
+            portfolio_id=config.portfolio_id,
             evaluation_id=evaluation_id,
             allocation_id=allocation_id,
             rebalance_plan_id=rebalance_plan_id,
             rebalance_execution_id=rebalance_execution_id,
-            summary=summary
+            state_before_id=state_before_id,
+            state_after_id=state_after_id,
+            summary=summary,
+            status="completed",
+            skip_reason=None,
+            rules_violations=[v.to_dict() for v in rules_violations],
+            ruleset_type=config.ruleset_type,
+            ruleset_config=config.ruleset_config,
         )
         
     except Exception as e:
@@ -475,12 +899,16 @@ Example cycle_config.json:
                 artifact_store=artifact_store
             )
         
+        # Create state store
+        state_store = LocalPortfolioStateStore(artifact_store)
+        
         # Run cycle
         result = run_portfolio_cycle(
             config=config,
             research_engine=research_engine,
             artifact_store=artifact_store,
-            execution_engine_factory=create_engine
+            execution_engine_factory=create_engine,
+            state_store=state_store
         )
         
         # Persist cycle result
@@ -488,13 +916,25 @@ Example cycle_config.json:
         
         # Print summary
         print(f"Portfolio cycle complete: {cycle_id}")
-        print(f"Evaluation ID: {result.evaluation_id}")
-        print(f"Allocation ID: {result.allocation_id}")
-        print(f"Rebalance Plan ID: {result.rebalance_plan_id}")
-        print(f"Rebalance Execution ID: {result.rebalance_execution_id}")
-        print(f"Top strategy: {result.summary['allocation_summary']['top_strategy_id']}")
-        print(f"Strategies allocated: {result.summary['allocation_summary']['num_strategies']}")
-        print(f"Execution success rate: {result.summary['execution_summary']['success_rate']:.1%}")
+        print(f"Status: {result.status}")
+        if result.status != "completed":
+            print(f"Reason: {result.skip_reason}")
+        if result.evaluation_id:
+            print(f"Evaluation ID: {result.evaluation_id}")
+        if result.allocation_id:
+            print(f"Allocation ID: {result.allocation_id}")
+        if result.rebalance_plan_id:
+            print(f"Rebalance Plan ID: {result.rebalance_plan_id}")
+        if result.rebalance_execution_id:
+            print(f"Rebalance Execution ID: {result.rebalance_execution_id}")
+        if result.state_before_id:
+            print(f"State before ID: {result.state_before_id}")
+        if result.state_after_id:
+            print(f"State after ID: {result.state_after_id}")
+        if result.status == "completed":
+            print(f"Top strategy: {result.summary['allocation_summary']['top_strategy_id']}")
+            print(f"Strategies allocated: {result.summary['allocation_summary']['num_strategies']}")
+            print(f"Execution success rate: {result.summary['execution_summary']['success_rate']:.1%}")
         
         sys.exit(0)
         

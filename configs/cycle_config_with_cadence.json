@@ -1,0 +1,65 @@
+{
+  "portfolio_id": "demo_portfolio",
+  "evaluation_config": {
+    "strategies": [
+      {
+        "strategy_id": "demo_momentum_v1",
+        "experiment_name": "momentum",
+        "experiment_version": "v1",
+        "experiment_config": { "daily_trend": 0.00005 },
+        "inputs": {
+          "start_date": "2024-01-01",
+          "end_date": "2024-03-31",
+          "initial_capital": 100000,
+          "instrument": "AAPL",
+          "strategy_type": "buy_hold"
+        },
+        "description": "Demo strategy"
+      }
+    ],
+    "parameter_grid": null,
+    "evaluation_criteria": {
+      "min_robustness_score": 0.0,
+      "max_divergence_pct": 1.0,
+      "max_timing_drift_seconds": 999999
+    },
+    "price_series": [150, 151, 152, 153, 154, 155, 156, 157, 158, 159]
+  },
+  "allocation_config": {
+    "total_capital": 100000,
+    "top_n_strategies": 1,
+    "min_robustness_score": 0.0,
+    "max_allocation_per_strategy": 1.0,
+    "min_allocation_per_strategy": 0.0,
+    "allocation_method": "equal",
+    "max_total_leverage": 1.0,
+    "require_all_passed": false
+  },
+  "rebalance_config": {
+    "rebalance_threshold_pct": 0.0,
+    "max_turnover_pct": 1.0,
+    "min_trade_size": 0.0,
+    "allow_partial_rebalance": true
+  },
+  "execution_config": {
+    "price_by_strategy_or_instrument": {
+      "demo_momentum_v1": 150.0,
+      "AAPL": 150.0
+    },
+    "rounding_method": "floor",
+    "min_quantity": 1.0
+  },
+  "cadence_config": {
+    "frequency": "daily",
+    "min_seconds_between_cycles": 86400,
+    "timezone": "UTC"
+  },
+  "guardrails_config": {
+    "max_turnover_pct_per_cycle": 1.0,
+    "max_failed_intents": 0,
+    "min_execution_success_rate": 0.95,
+    "max_single_strategy_allocation_fraction": 1.0,
+    "halt_on_any_error": false
+  }
+}
+

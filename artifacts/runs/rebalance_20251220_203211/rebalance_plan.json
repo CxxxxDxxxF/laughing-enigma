@@ -1,0 +1,36 @@
+{
+  "plan_id": "rebalance_20251220_203211",
+  "plan_timestamp": "2025-12-20T20:32:11.528765",
+  "allocation_result_id": "alloc_20251220_203211",
+  "current_state": {
+    "strategy_allocations": {},
+    "total_capital": 100000,
+    "timestamp": "2025-12-20T20:32:11.524818"
+  },
+  "config": {
+    "rebalance_threshold_pct": 0.0,
+    "max_turnover_pct": 1.0,
+    "min_trade_size": 0.0,
+    "allow_partial_rebalance": true
+  },
+  "trade_intents": [
+    {
+      "strategy_id": "demo_momentum_v1",
+      "direction": "buy",
+      "amount": 100000.0,
+      "current_allocation": 0.0,
+      "target_allocation": 100000.0,
+      "delta": 100000.0
+    }
+  ],
+  "metrics": {
+    "num_trades": 1,
+    "total_turnover": 100000.0,
+    "turnover_pct": 100.0,
+    "percent_capital_moved": 100.0,
+    "buy_count": 1,
+    "sell_count": 0,
+    "buy_amount": 100000.0,
+    "sell_amount": 0
+  }
+}

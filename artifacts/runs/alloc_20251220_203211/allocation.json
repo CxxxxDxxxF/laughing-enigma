@@ -1,0 +1,37 @@
+{
+  "allocation_id": "alloc_20251220_203211",
+  "allocation_timestamp": "2025-12-20T20:32:11.528589",
+  "config": {
+    "total_capital": 100000,
+    "top_n_strategies": 1,
+    "min_robustness_score": 0.0,
+    "max_allocation_per_strategy": 1.0,
+    "min_allocation_per_strategy": 0.0,
+    "allocation_method": "equal",
+    "max_total_leverage": 1.0,
+    "require_all_passed": false
+  },
+  "total_capital": 100000,
+  "allocated_capital": 100000.0,
+  "unallocated_capital": 0.0,
+  "allocations": [
+    {
+      "strategy_id": "demo_momentum_v1",
+      "experiment_name": "momentum",
+      "experiment_version": "v1",
+      "allocated_capital": 100000.0,
+      "allocation_fraction": 1.0,
+      "robustness_score": 0.9222854402785797,
+      "rank": 1
+    }
+  ],
+  "metrics": {
+    "num_strategies": 1,
+    "total_allocation_fraction": 1.0,
+    "average_robustness_score": 0.9222854402785797,
+    "weighted_average_robustness": 0.9222854402785797,
+    "min_allocation": 100000.0,
+    "max_allocation": 100000.0,
+    "concentration_ratio": 1.0
+  }
+}
