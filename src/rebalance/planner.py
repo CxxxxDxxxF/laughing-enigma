@@ -17,6 +17,10 @@ from enum import Enum
 
 from ..allocation import AllocationResult, PortfolioAllocation
 from ..core.artifacts import ArtifactStore
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..lifecycle.runner import ExecutionMode
 
 
 class RebalanceError(Exception):
@@ -438,7 +442,9 @@ def plan_rebalance(
     allocation_result: AllocationResult,
     current_state: CurrentPortfolioState,
     config: Optional[RebalanceConfig] = None,
-    plan_id: Optional[str] = None
+    plan_id: Optional[str] = None,
+    plan_timestamp: Optional[datetime] = None,
+    execution_mode: Optional['ExecutionMode'] = None
 ) -> RebalancePlan:
     """Plan a rebalance from current state to target allocations.
     
@@ -459,13 +465,15 @@ def plan_rebalance(
         allocation_result: Target allocations from allocation layer
         current_state: Current portfolio state
         config: Rebalance configuration (default: RebalanceConfig with defaults)
-        plan_id: Optional plan identifier (auto-generated if not provided)
+        plan_id: Optional plan identifier (required in LIVE mode)
+        plan_timestamp: Optional plan timestamp (required in LIVE mode)
+        execution_mode: Optional execution mode (ExecutionMode enum, for validation)
         
     Returns:
         RebalancePlan with trade intents and metrics
         
     Raises:
-        RebalanceError: If rebalance planning fails
+        RebalanceError: If rebalance planning fails or LIVE mode validation fails
         
     Example:
         >>> config = RebalanceConfig(
@@ -477,8 +485,22 @@ def plan_rebalance(
         >>> print(f"Number of trades: {plan.metrics['num_trades']}")
         >>> print(f"Total turnover: ${plan.metrics['total_turnover']:,.2f}")
     """
+    # Validate LIVE/LIVE_DRY mode requirements
+    if execution_mode is not None:
+        # Check for LIVE or LIVE_DRY mode (string comparison to avoid circular import)
+        if str(execution_mode) in ("live", "live_dry"):
+            if plan_id is None:
+                raise RebalanceError("LIVE mode requires explicit plan_id")
+            if plan_timestamp is None:
+                raise RebalanceError("LIVE mode requires explicit plan_timestamp")
+    
+    # Generate plan_id if not provided (SIMULATION mode only)
     if plan_id is None:
         plan_id = f"rebalance_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Use provided timestamp or fallback to now (SIMULATION mode only)
+    if plan_timestamp is None:
+        plan_timestamp = datetime.now()
     
     if config is None:
         config = RebalanceConfig()
@@ -511,9 +533,10 @@ def plan_rebalance(
         # Step 6: Compute metrics
         metrics = _compute_rebalance_metrics(trade_intents, current_state.total_capital, original_deltas)
         
+        # plan_timestamp already set above
         return RebalancePlan(
             plan_id=plan_id,
-            plan_timestamp=datetime.now(),
+            plan_timestamp=plan_timestamp,
             allocation_result_id=allocation_result.allocation_id,
             current_state=current_state,
             config=config,

@@ -19,6 +19,10 @@ import math
 from .planner import RebalancePlan, TradeIntent, TradeDirection, RebalanceError
 from ..execution import Signal, SignalType, PaperExecutionEngine, Order, Fill
 from ..core.artifacts import ArtifactStore
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..lifecycle.runner import ExecutionMode
 
 
 class RebalanceExecutionError(Exception):
@@ -239,7 +243,9 @@ def execute_rebalance_plan(
     execution_engine: PaperExecutionEngine,
     price_by_strategy_or_instrument: Dict[str, float],
     mapper: Optional[RebalanceSignalMapper] = None,
-    execution_id: Optional[str] = None
+    execution_id: Optional[str] = None,
+    execution_timestamp: Optional[datetime] = None,
+    execution_mode: Optional['ExecutionMode'] = None
 ) -> RebalanceExecutionResult:
     """Execute a rebalance plan through paper execution engine.
     
@@ -270,13 +276,15 @@ def execute_rebalance_plan(
         execution_engine: PaperExecutionEngine to execute through
         price_by_strategy_or_instrument: Dictionary mapping strategy_id or instrument → price
         mapper: Optional signal mapper (default: RebalanceSignalMapper with floor rounding)
-        execution_id: Optional execution identifier (auto-generated if not provided)
+        execution_id: Optional execution identifier (required in LIVE mode)
+        execution_timestamp: Optional execution timestamp (required in LIVE mode)
+        execution_mode: Optional execution mode (ExecutionMode enum, for validation)
         
     Returns:
         RebalanceExecutionResult with execution results and mapping
         
     Raises:
-        RebalanceExecutionError: If execution setup fails (not per-intent errors)
+        RebalanceExecutionError: If execution setup fails (not per-intent errors) or LIVE mode validation fails
         
     Example:
         >>> prices = {"strat_1": 150.0, "strat_2": 200.0}
@@ -284,8 +292,22 @@ def execute_rebalance_plan(
         >>> print(f"Successful: {result.execution_summary['successful_intents']}")
         >>> print(f"Failed: {result.execution_summary['failed_intents']}")
     """
+    # Validate LIVE/LIVE_DRY mode requirements
+    if execution_mode is not None:
+        # Check for LIVE or LIVE_DRY mode (string comparison to avoid circular import)
+        if str(execution_mode) in ("live", "live_dry"):
+            if execution_id is None:
+                raise RebalanceExecutionError("LIVE mode requires explicit execution_id")
+            if execution_timestamp is None:
+                raise RebalanceExecutionError("LIVE mode requires explicit execution_timestamp")
+    
+    # Generate execution_id if not provided (SIMULATION mode only)
     if execution_id is None:
         execution_id = f"rebalance_exec_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Use provided timestamp or fallback to now (SIMULATION mode only)
+    if execution_timestamp is None:
+        execution_timestamp = datetime.now()
     
     if mapper is None:
         mapper = RebalanceSignalMapper(rounding_method="floor")
@@ -433,7 +455,7 @@ def execute_rebalance_plan(
     
     return RebalanceExecutionResult(
         execution_id=execution_id,
-        execution_timestamp=datetime.now(),
+        execution_timestamp=execution_timestamp,
         plan_id=plan.plan_id,
         intent_results=intent_results,
         execution_summary=execution_summary,

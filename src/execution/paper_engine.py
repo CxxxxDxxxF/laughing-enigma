@@ -5,7 +5,6 @@ for single-instrument backtesting with market orders only.
 """
 
 import json
-import uuid
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -14,6 +13,8 @@ from .order import Order, OrderStatus, OrderType
 from .fill import Fill
 from .position import Position
 from .engine import ExecutionEngine, ExecutionEngineError, OrderRejectionError, RiskLimitExceededError, RiskLimits
+from .clock import ExecutionClock, SimulationClock
+from .id_provider import IDProvider, SimulationIDProvider
 
 try:
     from ..core.artifacts import ArtifactStore, ArtifactStoreError
@@ -52,7 +53,9 @@ class PaperExecutionEngine(ExecutionEngine):
         risk_limits: Optional[RiskLimits] = None,
         fixed_fee: float = 0.0,
         artifact_store: Optional['ArtifactStore'] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        clock: Optional[ExecutionClock] = None,
+        id_provider: Optional[IDProvider] = None
     ):
         """Initialize paper execution engine.
         
@@ -61,7 +64,11 @@ class PaperExecutionEngine(ExecutionEngine):
             risk_limits: Risk limits configuration (default: no limits)
             fixed_fee: Fixed fee per fill in dollars (default: 0.0)
             artifact_store: Optional artifact store for persistence
-            session_id: Optional session identifier (defaults to generated UUID)
+            session_id: Optional session identifier (defaults to generated from id_provider)
+            clock: Optional execution clock for timestamp generation (default: SimulationClock)
+                  In LIVE mode, use FixedClock seeded from cycle_timestamp for determinism
+            id_provider: Optional ID provider for ID generation (default: SimulationIDProvider)
+                        In LIVE mode, use DeterministicIDProvider seeded from cycle_id for determinism
             
         Raises:
             ValueError: If instrument is empty or fixed_fee is negative
@@ -76,7 +83,9 @@ class PaperExecutionEngine(ExecutionEngine):
         self.risk_limits = risk_limits or RiskLimits()
         self.fixed_fee = fixed_fee
         self.artifact_store = artifact_store
-        self.session_id = session_id or str(uuid.uuid4())
+        self.id_provider = id_provider or SimulationIDProvider()
+        self.clock = clock or SimulationClock()  # Default to simulation clock
+        self.session_id = session_id or self.id_provider.new_session_id()
         
         # State storage
         self.orders: Dict[str, Order] = {}
@@ -106,7 +115,7 @@ class PaperExecutionEngine(ExecutionEngine):
                 quantity=0.0,
                 cost_basis=1.0,  # Placeholder value for flat positions
                 realized_pnl=0.0,
-                updated_at=datetime.now()
+                updated_at=self.clock.now()
             )
         return self.positions[instrument]
     
@@ -186,7 +195,7 @@ class PaperExecutionEngine(ExecutionEngine):
         """
         # Handle HOLD signals (no action)
         if signal.signal_type == SignalType.HOLD:
-            order_id = str(uuid.uuid4())
+            order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
             order = Order(
                 id=order_id,
                 signal_id=None,
@@ -203,7 +212,7 @@ class PaperExecutionEngine(ExecutionEngine):
         
         # Validate signal instrument matches engine instrument
         if signal.instrument != self.instrument:
-            order_id = str(uuid.uuid4())
+            order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
             order = Order(
                 id=order_id,
                 signal_id=None,
@@ -220,7 +229,7 @@ class PaperExecutionEngine(ExecutionEngine):
         
         # Check instrument is allowed
         if not self.risk_limits.is_instrument_allowed(signal.instrument):
-            order_id = str(uuid.uuid4())
+            order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
             order = Order(
                 id=order_id,
                 signal_id=None,
@@ -236,7 +245,7 @@ class PaperExecutionEngine(ExecutionEngine):
             return order
         
         # Create order (risk limits checked during execution when we have current_price)
-        order_id = str(uuid.uuid4())
+        order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
         order = Order(
             id=order_id,
             signal_id=None,
@@ -246,7 +255,7 @@ class PaperExecutionEngine(ExecutionEngine):
             quantity=signal.quantity,
             status=OrderStatus.ACCEPTED,
             created_at=signal.timestamp,
-            accepted_at=datetime.now()
+            accepted_at=self.clock.now()
         )
         
         self.orders[order_id] = order
@@ -285,7 +294,7 @@ class PaperExecutionEngine(ExecutionEngine):
             RiskLimitExceededError: If risk limits would be violated
         """
         if timestamp is None:
-            timestamp = datetime.now()
+            timestamp = self.clock.now()
         
         # Validate order state
         if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
@@ -331,7 +340,7 @@ class PaperExecutionEngine(ExecutionEngine):
             raise OrderRejectionError(f"Order rejected due to risk limits: {e}") from e
         
         # Create fill (full fill, immediate)
-        fill_id = str(uuid.uuid4())
+        fill_id = self.id_provider.new_fill_id(order_id=order.id)
         fill = Fill(
             id=fill_id,
             order_id=order.id,
@@ -410,7 +419,7 @@ class PaperExecutionEngine(ExecutionEngine):
             status=OrderStatus.CANCELED,
             created_at=order.created_at,
             accepted_at=order.accepted_at,
-            canceled_at=datetime.now()
+            canceled_at=self.clock.now()
         )
         
         self.orders[order_id] = canceled_order
@@ -543,7 +552,7 @@ class PaperExecutionEngine(ExecutionEngine):
                 "session_id": self.session_id,
                 "instrument": self.instrument,
                 "fixed_fee": self.fixed_fee,
-                "created_at": datetime.now().isoformat(),
+                "created_at": self.clock.now().isoformat(),
             }
             metadata_json = json.dumps(metadata, indent=2).encode('utf-8')
             self.artifact_store.store(self.session_id, "session_metadata.json", metadata_json)

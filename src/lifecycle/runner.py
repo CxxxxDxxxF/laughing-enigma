@@ -22,6 +22,7 @@ from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
 
 from ..evaluation.batch import (
     BatchEvaluationConfig,
@@ -53,9 +54,290 @@ from .guardrails import GuardrailsConfig, check_allocation_guardrails, check_reb
 from ..rules import Ruleset, RulesViolation, RulesViolationSeverity
 
 
+class ExecutionMode(str, Enum):
+    """Execution mode for portfolio cycles.
+    
+    SIMULATION: Allows relaxed constraints for testing/backtesting
+    LIVE_DRY: Enforces strict LIVE constraints but does not place real orders (for testing/validation)
+    LIVE: Enforces strict constraints for production trading with real orders
+    """
+    SIMULATION = "simulation"
+    LIVE_DRY = "live_dry"
+    LIVE = "live"
+
+
 class CycleError(Exception):
     """Error raised when portfolio cycle execution fails."""
     pass
+
+
+class CycleHaltError(CycleError):
+    """Error raised when cycle halts in LIVE mode.
+    
+    This exception is raised instead of returning a halted CycleResult
+    to prevent continuation after a halt in LIVE mode.
+    """
+    def __init__(self, message: str, result: 'CycleResult'):
+        super().__init__(message)
+        self.result = result
+
+
+class HaltFlagStore:
+    """Helper for managing persistent halt flags for portfolios.
+    
+    Halt flags are written to artifacts/portfolio/{portfolio_id}/HALTED
+    and prevent cycles from running in LIVE mode until manually cleared.
+    """
+    
+    def __init__(self, artifact_store: ArtifactStore):
+        """Initialize halt flag store.
+        
+        Args:
+            artifact_store: ArtifactStore instance for persistence
+        """
+        self.artifact_store = artifact_store
+    
+    def _get_halt_flag_path(self, portfolio_id: str) -> Path:
+        """Get path for halt flag file.
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            
+        Returns:
+            Path to halt flag file
+        """
+        # Get base path from artifact store
+        if hasattr(self.artifact_store, 'base_path'):
+            base_path = Path(self.artifact_store.base_path)
+        else:
+            base_path = Path("./artifacts")
+        
+        return base_path / "portfolio" / portfolio_id / "HALTED"
+    
+    def write_halt_flag(
+        self,
+        portfolio_id: str,
+        cycle_id: str,
+        reason: str,
+        halted_at: datetime,
+        violations_summary: Optional[List[Dict[str, Any]]] = None
+    ) -> None:
+        """Write halt flag to disk (atomic write).
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            cycle_id: Cycle ID that triggered the halt
+            reason: Halt reason
+            halted_at: Timestamp when halt occurred
+            violations_summary: Optional list of violation dicts
+            
+        Raises:
+            CycleError: If write fails
+        """
+        try:
+            flag_path = self._get_halt_flag_path(portfolio_id)
+            
+            # Create data structure
+            flag_data = {
+                "halted_at": halted_at.isoformat(),
+                "cycle_id": cycle_id,
+                "reason": reason,
+                "violations_summary": violations_summary or []
+            }
+            
+            # Atomic write: write to temp file, then rename
+            flag_json = json.dumps(flag_data, indent=2).encode('utf-8')
+            temp_path = flag_path.with_suffix('.tmp')
+            
+            # Create parent directory if needed
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write to temp file
+            temp_path.write_bytes(flag_json)
+            
+            # Atomic rename
+            temp_path.replace(flag_path)
+            
+        except Exception as e:
+            raise CycleError(f"Failed to write halt flag for portfolio {portfolio_id}: {e}") from e
+    
+    def halt_flag_exists(self, portfolio_id: str) -> bool:
+        """Check if halt flag exists.
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            
+        Returns:
+            True if halt flag exists, False otherwise
+        """
+        flag_path = self._get_halt_flag_path(portfolio_id)
+        return flag_path.exists()
+    
+    def read_halt_flag(self, portfolio_id: str) -> Optional[Dict[str, Any]]:
+        """Read halt flag data.
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            
+        Returns:
+            Halt flag data as dict, or None if flag doesn't exist
+            
+        Raises:
+            CycleError: If read fails
+        """
+        flag_path = self._get_halt_flag_path(portfolio_id)
+        
+        if not flag_path.exists():
+            return None
+        
+        try:
+            data = json.loads(flag_path.read_bytes().decode('utf-8'))
+            return data
+        except Exception as e:
+            raise CycleError(f"Failed to read halt flag for portfolio {portfolio_id}: {e}") from e
+    
+    def clear_halt_flag(self, portfolio_id: str) -> None:
+        """Clear halt flag (manual unhalt).
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            
+        Raises:
+            CycleError: If clear fails
+        """
+        flag_path = self._get_halt_flag_path(portfolio_id)
+        
+        if not flag_path.exists():
+            return  # Already cleared
+        
+        try:
+            flag_path.unlink()
+        except Exception as e:
+            raise CycleError(f"Failed to clear halt flag for portfolio {portfolio_id}: {e}") from e
+
+
+def _is_live_mode(execution_mode: ExecutionMode) -> bool:
+    """Check if execution mode is LIVE or LIVE_DRY.
+    
+    Args:
+        execution_mode: Execution mode
+        
+    Returns:
+        True if mode is LIVE or LIVE_DRY (both enforce strict constraints)
+    """
+    return execution_mode in (ExecutionMode.LIVE, ExecutionMode.LIVE_DRY)
+
+
+def _validate_live_mode_timestamps(
+    execution_mode: ExecutionMode,
+    cycle_timestamp: Optional[datetime]
+) -> None:
+    """Validate that timestamps are explicitly provided in LIVE/LIVE_DRY mode.
+    
+    Args:
+        execution_mode: Execution mode
+        cycle_timestamp: Cycle timestamp (must be explicitly provided in LIVE/LIVE_DRY mode, not None)
+        
+    Raises:
+        CycleError: If LIVE/LIVE_DRY mode but timestamp is None (would be generated from datetime.now())
+    """
+    if _is_live_mode(execution_mode) and cycle_timestamp is None:
+        raise CycleError("LIVE/LIVE_DRY mode requires explicit cycle_timestamp parameter (cannot use datetime.now() fallback)")
+
+
+def _validate_live_mode_guardrails(
+    execution_mode: ExecutionMode,
+    guardrails_config: Optional[GuardrailsConfig]
+) -> None:
+    """Validate that guardrails are properly configured for LIVE/LIVE_DRY mode.
+    
+    Args:
+        execution_mode: Execution mode
+        guardrails_config: Guardrails configuration (should be non-permissive in LIVE/LIVE_DRY mode)
+        
+    Raises:
+        CycleError: If LIVE/LIVE_DRY mode but guardrails are missing or too permissive
+    """
+    if not _is_live_mode(execution_mode):
+        return
+    
+    if guardrails_config is None:
+        raise CycleError("LIVE mode requires guardrails_config to be set")
+    
+    if guardrails_config.max_turnover_pct_per_cycle >= 1.0:
+        raise CycleError(
+            f"LIVE mode requires max_turnover_pct_per_cycle < 1.0, "
+            f"got: {guardrails_config.max_turnover_pct_per_cycle}"
+        )
+    
+    if guardrails_config.max_failed_intents is None:
+        raise CycleError("LIVE mode requires max_failed_intents to be set")
+    
+    if guardrails_config.min_execution_success_rate <= 0.0:
+        raise CycleError(
+            f"LIVE mode requires min_execution_success_rate > 0.0, "
+            f"got: {guardrails_config.min_execution_success_rate}"
+        )
+    
+    if guardrails_config.max_single_strategy_allocation_fraction >= 1.0:
+        raise CycleError(
+            f"LIVE mode requires max_single_strategy_allocation_fraction < 1.0, "
+            f"got: {guardrails_config.max_single_strategy_allocation_fraction}"
+        )
+
+
+def _validate_portfolio_not_halted(
+    execution_mode: ExecutionMode,
+    state_store: Optional[PortfolioStateStore],
+    portfolio_id: str,
+    artifact_store: ArtifactStore
+) -> None:
+    """Validate that portfolio is not in halted state in LIVE/LIVE_DRY mode.
+    
+    Args:
+        execution_mode: Execution mode
+        state_store: Portfolio state store (not used, kept for API compatibility)
+        portfolio_id: Portfolio identifier
+        artifact_store: Artifact store (used to check halt flag)
+        
+    Raises:
+        CycleError: If LIVE/LIVE_DRY mode and portfolio is in halted state
+    """
+    if not _is_live_mode(execution_mode):
+        return
+    
+    halt_store = HaltFlagStore(artifact_store)
+    if halt_store.halt_flag_exists(portfolio_id):
+        halt_data = halt_store.read_halt_flag(portfolio_id)
+        reason = halt_data.get("reason", "Unknown") if halt_data else "Unknown"
+        cycle_id = halt_data.get("cycle_id", "Unknown") if halt_data else "Unknown"
+        raise CycleError(
+            f"Portfolio {portfolio_id} is halted (halted at cycle {cycle_id}: {reason}). "
+            "Manual intervention required before continuing. Use clear_halt_flag() to unhalt."
+        )
+
+
+def _validate_live_mode_cycle_id(
+    execution_mode: ExecutionMode,
+    cycle_id: Optional[str],
+    config_cycle_id: Optional[str]
+) -> None:
+    """Validate that cycle_id is explicitly provided in LIVE/LIVE_DRY mode.
+    
+    Args:
+        execution_mode: Execution mode
+        cycle_id: Cycle ID parameter (may be None)
+        config_cycle_id: Cycle ID from config (may be None)
+        
+    Raises:
+        CycleError: If LIVE/LIVE_DRY mode but cycle_id is not explicitly provided
+    """
+    if _is_live_mode(execution_mode):
+        if cycle_id is None and config_cycle_id is None:
+            raise CycleError(
+                "LIVE/LIVE_DRY mode requires explicit cycle_id parameter or config.cycle_id "
+                "(cannot auto-generate from datetime.now())"
+            )
 
 
 @dataclass
@@ -88,6 +370,7 @@ class PortfolioCycleConfig:
     guardrails_config: Optional[GuardrailsConfig] = None
     ruleset_type: Optional[str] = None  # "topstep" or None
     ruleset_config: Optional[Dict[str, Any]] = None
+    day_boundary_config: Optional[Dict[str, Any]] = None  # Trading day boundary config (timezone, session_start_time)
     cycle_id: Optional[str] = None
     validation_hold_quantity: bool = False  # Phase 15 validation-only: skip allocation/rebalance, hold positions
     validation_bootstrap_first_cycle: bool = True  # Phase 15: run cycle 1 normally to establish position
@@ -161,6 +444,9 @@ class PortfolioCycleConfig:
             ruleset_type = data.get("ruleset_type")
             ruleset_config = data.get("ruleset_config")
             
+            # Day boundary config (for session-based trading days)
+            day_boundary_config = data.get("day_boundary_config")
+            
             # Validation-only flags (Phase 15)
             validation_hold_quantity = data.get("validation_hold_quantity", False)
             validation_bootstrap_first_cycle = data.get("validation_bootstrap_first_cycle", True)
@@ -175,6 +461,7 @@ class PortfolioCycleConfig:
                 guardrails_config=guardrails_config,
                 ruleset_type=ruleset_type,
                 ruleset_config=ruleset_config,
+                day_boundary_config=day_boundary_config,
                 cycle_id=data.get("cycle_id"),
                 validation_hold_quantity=validation_hold_quantity,
                 validation_bootstrap_first_cycle=validation_bootstrap_first_cycle,
@@ -311,7 +598,9 @@ def run_portfolio_cycle(
     artifact_store: ArtifactStore,
     execution_engine_factory: Callable[[], PaperExecutionEngine],
     state_store: Optional[PortfolioStateStore] = None,
-    cycle_id: Optional[str] = None
+    cycle_id: Optional[str] = None,
+    execution_mode: ExecutionMode = ExecutionMode.SIMULATION,
+    cycle_timestamp: Optional[datetime] = None
 ) -> CycleResult:
     # Step 0: Debug print - verify flags are being read
     print(f"RUN_CYCLE cycle_id={config.cycle_id or cycle_id} hold={config.validation_hold_quantity} bootstrap={config.validation_bootstrap_first_cycle}")
@@ -339,6 +628,8 @@ def run_portfolio_cycle(
                                  (must create isolated sessions)
         state_store: Optional portfolio state store (for stateful operation)
         cycle_id: Optional cycle identifier (auto-generated if not provided)
+        execution_mode: Execution mode (SIMULATION, LIVE_DRY, or LIVE)
+        cycle_timestamp: Optional explicit cycle timestamp (required in LIVE mode)
         
     Returns:
         CycleResult with references to all sub-artifacts and summary
@@ -359,10 +650,26 @@ def run_portfolio_cycle(
         ... )
         >>> print(f"Cycle {result.cycle_id} status: {result.status}")
     """
-    if cycle_id is None:
-        cycle_id = config.cycle_id or f"cycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Top-level validation for LIVE mode (before timestamp fallback)
+    _validate_live_mode_timestamps(execution_mode, cycle_timestamp)
+    _validate_live_mode_guardrails(execution_mode, config.guardrails_config)
+    _validate_portfolio_not_halted(execution_mode, state_store, config.portfolio_id, artifact_store)
+    _validate_live_mode_cycle_id(execution_mode, cycle_id, config.cycle_id)
     
-    cycle_timestamp = datetime.now()
+    if cycle_timestamp is None:
+        cycle_timestamp = datetime.now()
+    
+    # Generate cycle_id if not provided
+    if cycle_id is None:
+        cycle_id = config.cycle_id
+        if cycle_id is None:
+            # Prefer generating from cycle_timestamp if available (deterministic)
+            if cycle_timestamp is not None:
+                cycle_id = f"cycle_{cycle_timestamp.strftime('%Y%m%d_%H%M%S')}"
+            else:
+                # Fallback to datetime.now() only when cycle_timestamp is also None
+                cycle_id = f"cycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
     state_before_id = None
     state_after_id = None
     rules_violations: List[RulesViolation] = []
@@ -396,7 +703,16 @@ def run_portfolio_cycle(
                 # Execution timestamp must be >= last state timestamp
                 if cycle_timestamp < current_state.timestamp:
                     # Time reversal detected - HALT cycle
-                    return CycleResult(
+                    violations = [{
+                        "code": "TIME_REVERSAL",
+                        "message": f"Execution timestamp {cycle_timestamp.isoformat()} is before last state timestamp {current_state.timestamp.isoformat()}",
+                        "severity": "halt",
+                        "metadata": {
+                            "cycle_timestamp": cycle_timestamp.isoformat(),
+                            "last_state_timestamp": current_state.timestamp.isoformat(),
+                        }
+                    }]
+                    result = CycleResult(
                         cycle_id=cycle_id,
                         cycle_timestamp=cycle_timestamp,
                         portfolio_id=config.portfolio_id,
@@ -409,19 +725,27 @@ def run_portfolio_cycle(
                         summary={},
                     status="halted",
                     skip_reason=f"Time reversal detected: cycle timestamp {cycle_timestamp.isoformat()} < last state timestamp {current_state.timestamp.isoformat()}",
-                    rules_violations=[{
-                        "code": "TIME_REVERSAL",
-                        "message": f"Execution timestamp {cycle_timestamp.isoformat()} is before last state timestamp {current_state.timestamp.isoformat()}",
-                        "severity": "halt",
-                        "metadata": {
-                            "cycle_timestamp": cycle_timestamp.isoformat(),
-                            "last_state_timestamp": current_state.timestamp.isoformat(),
-                        }
-                    }],
+                    rules_violations=violations,
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
-                )
+                    )
+                    if _is_live_mode(execution_mode):
+                        # Write halt flag before raising exception
+                        halt_store = HaltFlagStore(artifact_store)
+                        halt_store.write_halt_flag(
+                            portfolio_id=config.portfolio_id,
+                            cycle_id=cycle_id,
+                            reason=result.skip_reason,
+                            halted_at=cycle_timestamp,
+                            violations_summary=violations
+                        )
+                        raise CycleHaltError(
+                            f"Cycle halted in LIVE mode: {result.skip_reason}. "
+                            "Manual intervention required before continuing.",
+                            result=result
+                        )
+                    return result
         
         # Step 0.5: Check cadence (if configured)
         # Normalize cadence_config to CycleCadenceConfig object if it's a dict
@@ -505,9 +829,18 @@ def run_portfolio_cycle(
         allocation_result = None
         allocation_id = None
         if use_normal_cycle:
+            # Generate allocation_id from cycle_id if available
+            allocation_id_param = f"{cycle_id}_alloc" if cycle_id else None
+            # TIMESTAMP CHAIN: allocation_timestamp MUST be derived from cycle_timestamp
+            # In LIVE mode, all timestamps (allocation, plan, execution) must come from
+            # a single source of truth (cycle_timestamp) to avoid clock skew.
+            # Do not independently supply timestamps from different clocks.
             allocation_result = allocate_capital(
                 evaluation=evaluation,
-                config=config.allocation_config
+                config=config.allocation_config,
+                allocation_id=allocation_id_param,
+                allocation_timestamp=cycle_timestamp,  # Derived from cycle_timestamp
+                execution_mode=execution_mode
             )
         
         # Check allocation guardrails (skip if hold-quantity mode)
@@ -522,7 +855,7 @@ def run_portfolio_cycle(
                 # Halt cycle
                 from ..allocation.allocator import persist_allocation
                 allocation_id = persist_allocation(allocation_result, artifact_store)
-                return CycleResult(
+                result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
                     portfolio_id=config.portfolio_id,
@@ -547,6 +880,22 @@ def run_portfolio_cycle(
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
                 )
+                if _is_live_mode(execution_mode):
+                    # Write halt flag before raising exception
+                    halt_store = HaltFlagStore(artifact_store)
+                    halt_store.write_halt_flag(
+                        portfolio_id=config.portfolio_id,
+                        cycle_id=cycle_id,
+                        reason=result.skip_reason,
+                        halted_at=cycle_timestamp,
+                        violations_summary=result.rules_violations
+                    )
+                    raise CycleHaltError(
+                        f"Cycle halted in LIVE mode: {result.skip_reason}. "
+                        "Manual intervention required before continuing.",
+                        result=result
+                    )
+                return result
         
         if use_normal_cycle:
             from ..allocation.allocator import persist_allocation
@@ -606,10 +955,17 @@ def run_portfolio_cycle(
         rebalance_plan = None
         rebalance_plan_id = None
         if use_normal_cycle:
+            # Generate plan_id from cycle_id if available
+            plan_id_param = f"{cycle_id}_plan" if cycle_id else None
+            # TIMESTAMP CHAIN: plan_timestamp MUST be derived from cycle_timestamp
+            # In LIVE mode, all timestamps must come from a single source to avoid clock skew.
             rebalance_plan = plan_rebalance(
                 allocation_result=allocation_result,
                 current_state=current_state,
-                config=config.rebalance_config
+                config=config.rebalance_config,
+                plan_id=plan_id_param,
+                plan_timestamp=cycle_timestamp,  # Derived from cycle_timestamp
+                execution_mode=execution_mode
             )
         
         # Check rebalance guardrails
@@ -623,7 +979,7 @@ def run_portfolio_cycle(
                 # Halt cycle
                 from ..rebalance.planner import persist_rebalance_plan
                 rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
-                return CycleResult(
+                result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
                     portfolio_id=config.portfolio_id,
@@ -649,6 +1005,22 @@ def run_portfolio_cycle(
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
                 )
+                if _is_live_mode(execution_mode):
+                    # Write halt flag before raising exception
+                    halt_store = HaltFlagStore(artifact_store)
+                    halt_store.write_halt_flag(
+                        portfolio_id=config.portfolio_id,
+                        cycle_id=cycle_id,
+                        reason=result.skip_reason,
+                        halted_at=cycle_timestamp,
+                        violations_summary=result.rules_violations
+                    )
+                    raise CycleHaltError(
+                        f"Cycle halted in LIVE mode: {result.skip_reason}. "
+                        "Manual intervention required before continuing.",
+                        result=result
+                    )
+                return result
         
         if use_normal_cycle:
             from ..rebalance.planner import persist_rebalance_plan
@@ -665,7 +1037,7 @@ def run_portfolio_cycle(
             # Check for HALT violations
             halt_violations = [v for v in plan_violations if v.severity == RulesViolationSeverity.HALT]
             if halt_violations:
-                return CycleResult(
+                result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
                     portfolio_id=config.portfolio_id,
@@ -691,6 +1063,22 @@ def run_portfolio_cycle(
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
                 )
+                if _is_live_mode(execution_mode):
+                    # Write halt flag before raising exception
+                    halt_store = HaltFlagStore(artifact_store)
+                    halt_store.write_halt_flag(
+                        portfolio_id=config.portfolio_id,
+                        cycle_id=cycle_id,
+                        reason=result.skip_reason,
+                        halted_at=cycle_timestamp,
+                        violations_summary=result.rules_violations
+                    )
+                    raise CycleHaltError(
+                        f"Cycle halted in LIVE mode: {result.skip_reason}. "
+                        "Manual intervention required before continuing.",
+                        result=result
+                    )
+                return result
         
         # Step 4: Rebalance execution (skip if hold-quantity mode)
         execution_engine = None
@@ -698,7 +1086,20 @@ def run_portfolio_cycle(
         rebalance_execution_id = None
         
         if use_normal_cycle:
-            execution_engine = execution_engine_factory()
+            # In LIVE/LIVE_DRY mode, engine must use FixedClock and DeterministicIDProvider
+            # seeded from cycle_timestamp/cycle_id to ensure deterministic timestamps and IDs.
+            # In SIMULATION mode, use SimulationClock and SimulationIDProvider (defaults).
+            from ..execution.clock import FixedClock
+            from ..execution.id_provider import DeterministicIDProvider
+            base_engine = execution_engine_factory()
+            if _is_live_mode(execution_mode):
+                # Replace clock with FixedClock for deterministic timestamps
+                base_engine.clock = FixedClock(cycle_timestamp)
+                # Replace ID provider with DeterministicIDProvider for deterministic IDs
+                # Use cycle_id as seed if available, else cycle_timestamp.isoformat()
+                id_seed = cycle_id if cycle_id else cycle_timestamp.isoformat()
+                base_engine.id_provider = DeterministicIDProvider(seed=id_seed)
+            execution_engine = base_engine
             
             price_by_strategy_or_instrument = config.execution_config.get(
                 "price_by_strategy_or_instrument", {}
@@ -709,11 +1110,21 @@ def run_portfolio_cycle(
                 min_quantity=config.execution_config.get("min_quantity", 0.0)
             )
             
+            # Generate execution_id from cycle_id if available
+            execution_id_param = f"{cycle_id}_exec" if cycle_id else None
+            # TIMESTAMP CHAIN: execution_timestamp MUST be derived from cycle_timestamp
+            # In LIVE mode, all timestamps (allocation, plan, execution) must come from
+            # a single source of truth (cycle_timestamp) to avoid clock skew.
+            # The execution engine's internal order/fill timestamps will also use this
+            # timestamp via the ExecutionClock abstraction.
             execution_result = execute_rebalance_plan(
                 plan=rebalance_plan,
                 execution_engine=execution_engine,
                 price_by_strategy_or_instrument=price_by_strategy_or_instrument,
-                mapper=mapper
+                mapper=mapper,
+                execution_id=execution_id_param,
+                execution_timestamp=cycle_timestamp,  # Derived from cycle_timestamp
+                execution_mode=execution_mode
             )
         
         # Check execution guardrails (skip if hold-quantity mode)
@@ -728,7 +1139,7 @@ def run_portfolio_cycle(
                 # Halt cycle (but execution already happened)
                 from ..rebalance.executor import persist_rebalance_execution
                 rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
-                return CycleResult(
+                result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
                     portfolio_id=config.portfolio_id,
@@ -755,6 +1166,22 @@ def run_portfolio_cycle(
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
                 )
+                if _is_live_mode(execution_mode):
+                    # Write halt flag before raising exception
+                    halt_store = HaltFlagStore(artifact_store)
+                    halt_store.write_halt_flag(
+                        portfolio_id=config.portfolio_id,
+                        cycle_id=cycle_id,
+                        reason=result.skip_reason,
+                        halted_at=cycle_timestamp,
+                        violations_summary=result.rules_violations
+                    )
+                    raise CycleHaltError(
+                        f"Cycle halted in LIVE mode: {result.skip_reason}. "
+                        "Manual intervention required before continuing.",
+                        result=result
+                    )
+                return result
         
         if use_normal_cycle:
             from ..rebalance.executor import persist_rebalance_execution
@@ -818,9 +1245,9 @@ def run_portfolio_cycle(
             
             if use_normal_cycle:
                 # Normal mode: validate execution result
-                # Create day boundary for validation (if configured)
+                # Create day boundary for validation (use config if available)
                 from ..rules.day_boundary import TradingDayBoundary
-                day_boundary = TradingDayBoundary()  # Default UTC
+                day_boundary = TradingDayBoundary.from_config(config.day_boundary_config)
                 
                 # validate_execution expects day_boundary parameter for Topstep ruleset
                 import inspect
@@ -902,7 +1329,7 @@ def run_portfolio_cycle(
                 computed_equity = equity  # Store for persistence and proof prints (set in outer scope)
                 if current_state.drawdown_tracker is not None:
                     from ..rules.day_boundary import TradingDayBoundary
-                    day_boundary = TradingDayBoundary()  # Default UTC
+                    day_boundary = TradingDayBoundary.from_config(config.day_boundary_config)
                     
                     # Update tracker with mark-to-market equity
                     snapshot = current_state.drawdown_tracker.update(
@@ -985,7 +1412,15 @@ def run_portfolio_cycle(
                 
                 # Create a minimal execution engine with these positions for validation
                 # We only need it for validate_execution, so create it with positions pre-loaded
-                execution_engine = execution_engine_factory()
+                # Use FixedClock and DeterministicIDProvider in LIVE/LIVE_DRY mode for determinism
+                from ..execution.clock import FixedClock
+                from ..execution.id_provider import DeterministicIDProvider
+                base_engine = execution_engine_factory()
+                if _is_live_mode(execution_mode):
+                    base_engine.clock = FixedClock(cycle_timestamp)
+                    id_seed = cycle_id if cycle_id else cycle_timestamp.isoformat()
+                    base_engine.id_provider = DeterministicIDProvider(seed=id_seed)
+                execution_engine = base_engine
                 if hasattr(execution_engine, 'positions'):
                     execution_engine.positions = positions
                 
@@ -1001,9 +1436,9 @@ def run_portfolio_cycle(
                     mapping={}
                 )
                 
-                # Create day boundary for validation (if configured)
+                # Create day boundary for validation (use config if available)
                 from ..rules.day_boundary import TradingDayBoundary
-                day_boundary = TradingDayBoundary()  # Default UTC
+                day_boundary = TradingDayBoundary.from_config(config.day_boundary_config)
                 
                 # validate_execution expects day_boundary parameter for Topstep ruleset
                 # Phase 15: In hold-quantity mode, skip equity recalculation to preserve precomputed equity
@@ -1030,7 +1465,7 @@ def run_portfolio_cycle(
             # Check for HALT violations
             halt_violations = [v for v in exec_violations if v.severity == RulesViolationSeverity.HALT]
             if halt_violations:
-                return CycleResult(
+                result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
                     portfolio_id=config.portfolio_id,
@@ -1048,7 +1483,7 @@ def run_portfolio_cycle(
                             "num_strategies": len(allocation_result.allocations),
                         },
                         "rebalance_summary": rebalance_plan.metrics,
-                        "execution_summary": execution_result.execution_summary,
+                        "execution_summary": execution_result.execution_summary if execution_result else {},
                     },
                     status="halted",
                     skip_reason=f"Ruleset violation: {halt_violations[0].message}",
@@ -1057,6 +1492,22 @@ def run_portfolio_cycle(
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
                 )
+                if _is_live_mode(execution_mode):
+                    # Write halt flag before raising exception
+                    halt_store = HaltFlagStore(artifact_store)
+                    halt_store.write_halt_flag(
+                        portfolio_id=config.portfolio_id,
+                        cycle_id=cycle_id,
+                        reason=result.skip_reason,
+                        halted_at=cycle_timestamp,
+                        violations_summary=result.rules_violations
+                    )
+                    raise CycleHaltError(
+                        f"Cycle halted in LIVE mode: {result.skip_reason}. "
+                        "Manual intervention required before continuing.",
+                        result=result
+                    )
+                return result
         
         # Step 5: Update portfolio state
         # Note: computed_equity is set in hold-quantity mode block above, and used here for state persistence

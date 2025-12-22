@@ -228,7 +228,7 @@ class TopstepRuleset(Ruleset):
             # Use day boundary for day rollover detection
             if day_boundary is None:
                 from .day_boundary import TradingDayBoundary
-                day_boundary = TradingDayBoundary()  # Default: UTC
+                day_boundary = TradingDayBoundary()  # Default: UTC, midnight
             
             # Phase 15: Only update tracker if we're not skipping equity recalculation
             # (When skip_equity_recalculation=True, tracker is already updated with correct equity)
@@ -265,7 +265,7 @@ class TopstepRuleset(Ruleset):
             # Check max_daily_loss
             if self.config.max_daily_loss is not None:
                 daily_loss = snapshot.equity - snapshot.initial_balance
-                if daily_loss < self.config.max_daily_loss:
+                if daily_loss <= self.config.max_daily_loss:
                     violations.append(RulesViolation(
                         code="TOPSTEP_MAX_DAILY_LOSS_EXCEEDED",
                         message=f"Daily loss {daily_loss:.2f} exceeds maximum {self.config.max_daily_loss:.2f}",

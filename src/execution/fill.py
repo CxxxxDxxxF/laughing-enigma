@@ -61,6 +61,15 @@ class Fill:
         if self.fee < 0:
             raise ValueError(f"Fill fee must be non-negative, got: {self.fee}")
     
+    @property
+    def timestamp(self) -> datetime:
+        """Canonical timestamp property (maps to filled_at).
+        
+        Returns:
+            Timestamp when fill occurred (same as filled_at)
+        """
+        return self.filled_at if self.filled_at else datetime.now()
+    
     def gross_value(self) -> float:
         """Compute gross value of fill (before fees).
         

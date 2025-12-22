@@ -1,27 +1,19 @@
-"""Analysis modules for strategy evaluation and survivability."""
+"""Analysis modules for portfolio evaluation and reporting."""
 
-from .divergence import (
-    DivergenceAnalysis,
-    DivergenceMetrics,
-    DivergencePoint,
-    DivergenceCause,
-    analyze_backtest_vs_paper,
-    persist_divergence_analysis,
-    DivergenceAnalysisError,
-)
-from .survivability import (
-    SurvivabilityMetrics,
-    analyze_survivability,
+from .evidence_report import (
+    EvidenceReport,
+    DailyEquity,
+    TradeStatistics,
+    generate_evidence_report,
+    report_to_dict,
+    print_evidence_report,
 )
 
 __all__ = [
-    "DivergenceAnalysis",
-    "DivergenceMetrics",
-    "DivergencePoint",
-    "DivergenceCause",
-    "analyze_backtest_vs_paper",
-    "persist_divergence_analysis",
-    "DivergenceAnalysisError",
-    "SurvivabilityMetrics",
-    "analyze_survivability",
+    "EvidenceReport",
+    "DailyEquity",
+    "TradeStatistics",
+    "generate_evidence_report",
+    "report_to_dict",
+    "print_evidence_report",
 ]

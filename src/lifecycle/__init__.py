@@ -10,6 +10,9 @@ from .runner import (
     run_portfolio_cycle,
     persist_cycle_result,
     CycleError,
+    CycleHaltError,
+    ExecutionMode,
+    HaltFlagStore,
 )
 from .state_store import (
     PortfolioStateStore,
@@ -35,6 +38,9 @@ __all__ = [
     "run_portfolio_cycle",
     "persist_cycle_result",
     "CycleError",
+    "CycleHaltError",
+    "ExecutionMode",
+    "HaltFlagStore",
     "PortfolioStateStore",
     "LocalPortfolioStateStore",
     "PortfolioStateStoreError",

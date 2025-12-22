@@ -10,31 +10,95 @@ Key invariant:
 - Trailing drawdown and high-water mark never reset (unless portfolio resets)
 """
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from datetime import datetime, date, time, timezone
 from dataclasses import dataclass
+import zoneinfo
+
+if TYPE_CHECKING:
+    from .drawdown import DrawdownTracker
 
 
 @dataclass(frozen=True)
 class TradingDayBoundary:
     """Trading day boundary configuration.
     
+    Trading day is defined as: "Date of the session that began most recently before timestamp"
+    
+    For example, if session_start_time is 17:00 (5 PM):
+    - 2024-01-01 16:00 → trading date is 2023-12-31 (previous day's session)
+    - 2024-01-01 17:00 → trading date is 2024-01-01 (new session started)
+    - 2024-01-02 16:00 → trading date is 2024-01-01 (still in same session)
+    
     Attributes:
         timezone: Timezone for trading day boundaries (default: UTC)
-        session_start_time: Start time of trading session (default: 00:00 UTC)
+        session_start_time: Start time of trading session (default: 00:00)
+                                  Time when new trading day/session begins (e.g., 17:00 for 5 PM)
     """
     
     timezone: timezone = timezone.utc
     session_start_time: time = time(0, 0, 0)  # Midnight
     
+    @classmethod
+    def from_config(cls, config: Optional[dict]) -> 'TradingDayBoundary':
+        """Create TradingDayBoundary from config dict.
+        
+        Args:
+            config: Optional dict with 'timezone' and 'session_start_time' keys
+                   - timezone: Timezone string (e.g., "America/Chicago", "UTC")
+                   - session_start_time: Time string (e.g., "17:00:00" for 5 PM)
+                   
+        Returns:
+            TradingDayBoundary instance
+            
+        Example:
+            >>> config = {"timezone": "America/Chicago", "session_start_time": "17:00:00"}
+            >>> boundary = TradingDayBoundary.from_config(config)
+        """
+        if config is None:
+            return cls()  # Default: UTC, midnight
+        
+        # Parse timezone
+        tz_str = config.get("timezone", "UTC")
+        if tz_str == "UTC":
+            tz = timezone.utc
+        else:
+            try:
+                tz = zoneinfo.ZoneInfo(tz_str)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+                # Fallback to UTC if timezone not found
+                tz = timezone.utc
+        
+        # Parse session_start_time
+        session_start_str = config.get("session_start_time", "00:00:00")
+        try:
+            # Parse "HH:MM:SS" or "HH:MM" format
+            parts = session_start_str.split(":")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            second = int(parts[2]) if len(parts) > 2 else 0
+            session_start = time(hour, minute, second)
+        except (ValueError, IndexError):
+            # Fallback to midnight if parsing fails
+            session_start = time(0, 0, 0)
+        
+        return cls(timezone=tz, session_start_time=session_start)
+    
     def get_trading_date(self, timestamp: datetime) -> date:
-        """Get trading date for a timestamp.
+        """Get trading date for a timestamp using session-based logic.
+        
+        Trading day is defined as: "Date of the session that began most recently before timestamp"
+        
+        For example, if session_start_time is 17:00 (5 PM):
+        - 2024-01-01 16:00 → trading date is 2023-12-31 (previous day's session)
+        - 2024-01-01 17:00 → trading date is 2024-01-01 (new session started)
+        - 2024-01-02 16:00 → trading date is 2024-01-01 (still in same session)
         
         Args:
             timestamp: Datetime (will be converted to self.timezone)
             
         Returns:
-            Trading date for this timestamp
+            Trading date for this timestamp (session-based, not calendar-based)
         """
         # Convert to configured timezone
         if timestamp.tzinfo is None:
@@ -44,8 +108,18 @@ class TradingDayBoundary:
             # Aware timestamp - convert to self.timezone
             timestamp = timestamp.astimezone(self.timezone)
         
-        # Return date (trading day is determined by date in configured timezone)
-        return timestamp.date()
+        # Get date and time components
+        cal_date = timestamp.date()
+        cal_time = timestamp.time()
+        
+        # If current time is before session start time, we're still in previous day's session
+        if cal_time < self.session_start_time:
+            # Trading day is the previous calendar date
+            from datetime import timedelta
+            return cal_date - timedelta(days=1)
+        else:
+            # Trading day is the current calendar date (session has started)
+            return cal_date
     
     def is_same_trading_day(self, timestamp1: datetime, timestamp2: datetime) -> bool:
         """Check if two timestamps are on the same trading day.

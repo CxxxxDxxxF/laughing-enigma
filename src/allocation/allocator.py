@@ -10,12 +10,15 @@ Determinism guarantees:
 """
 
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
 from ..evaluation import StrategyEvaluation, EvaluationResult
 from ..core.artifacts import ArtifactStore
+
+if TYPE_CHECKING:
+    from ..lifecycle.runner import ExecutionMode
 
 
 class AllocationError(Exception):
@@ -345,7 +348,9 @@ def _compute_allocation_metrics(
 def allocate_capital(
     evaluation: StrategyEvaluation,
     config: AllocationConfig,
-    allocation_id: Optional[str] = None
+    allocation_id: Optional[str] = None,
+    allocation_timestamp: Optional[datetime] = None,
+    execution_mode: Optional['ExecutionMode'] = None
 ) -> AllocationResult:
     """Allocate capital across strategies based on evaluation results.
     
@@ -363,13 +368,15 @@ def allocate_capital(
     Args:
         evaluation: Strategy evaluation results
         config: Allocation configuration
-        allocation_id: Optional allocation identifier (auto-generated if not provided)
+        allocation_id: Optional allocation identifier (required in LIVE mode)
+        allocation_timestamp: Optional allocation timestamp (required in LIVE mode)
+        execution_mode: Optional execution mode (ExecutionMode enum, for validation)
         
     Returns:
         AllocationResult with allocations and metrics
         
     Raises:
-        AllocationError: If allocation fails
+        AllocationError: If allocation fails or LIVE mode validation fails
         
     Example:
         >>> config = AllocationConfig(
@@ -380,8 +387,22 @@ def allocate_capital(
         >>> result = allocate_capital(evaluation, config)
         >>> print(f"Allocated {result.allocated_capital} across {len(result.allocations)} strategies")
     """
+    # Validate LIVE/LIVE_DRY mode requirements
+    if execution_mode is not None:
+        # Check for LIVE or LIVE_DRY mode (string comparison to avoid circular import)
+        if str(execution_mode) in ("live", "live_dry"):
+            if allocation_id is None:
+                raise AllocationError("LIVE mode requires explicit allocation_id")
+            if allocation_timestamp is None:
+                raise AllocationError("LIVE mode requires explicit allocation_timestamp")
+    
+    # Generate allocation_id if not provided (SIMULATION mode only)
     if allocation_id is None:
         allocation_id = f"alloc_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Use provided timestamp or fallback to now (SIMULATION mode only)
+    if allocation_timestamp is None:
+        allocation_timestamp = datetime.now()
     
     try:
         # Step 1: Filter strategies
@@ -389,9 +410,10 @@ def allocate_capital(
         
         if not candidates:
             # No strategies meet criteria - return empty allocation
+            # allocation_timestamp already set above
             return AllocationResult(
                 allocation_id=allocation_id,
-                allocation_timestamp=datetime.now(),
+                allocation_timestamp=allocation_timestamp,
                 config=config,
                 total_capital=config.total_capital,
                 allocated_capital=0.0,
@@ -433,9 +455,10 @@ def allocate_capital(
         allocated_capital = sum(a.allocated_capital for a in allocations)
         metrics = _compute_allocation_metrics(allocations, config.total_capital, evaluation)
         
+        # allocation_timestamp already set above
         return AllocationResult(
             allocation_id=allocation_id,
-            allocation_timestamp=datetime.now(),
+            allocation_timestamp=allocation_timestamp,
             config=config,
             total_capital=config.total_capital,
             allocated_capital=allocated_capital,

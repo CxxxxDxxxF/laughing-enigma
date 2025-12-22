@@ -279,10 +279,8 @@ def _calculate_paper_equity_series(
     """
     equity_series = []
     
-    # Create position lookup by date
-    positions_by_date_lookup = {
-        date.date(): pos for date, pos in positions_by_date.items()
-    }
+    # Create position lookup by date (keys are already date objects)
+    positions_by_date_lookup = positions_by_date
     
     # Build fill timeline: map date -> list of fills on that date
     fills_by_date: Dict[datetime.date, List[Fill]] = {}
