@@ -1,0 +1,20 @@
+{
+  "halted_at": "2024-01-01T12:00:00-06:00",
+  "cycle_id": "topstep_50k_LIVE_test3_cycle3",
+  "reason": "Ruleset violation: LIVE daily loss -1660.00 breached limit -1000.00",
+  "violations_summary": [
+    {
+      "code": "DAILY_LOSS_LIMIT",
+      "message": "LIVE daily loss -1660.00 breached limit -1000.00",
+      "severity": "halt",
+      "metadata": {
+        "daily_loss": -1660.0,
+        "live_daily_loss_limit": -1000.0,
+        "equity": 48340.0,
+        "initial_balance": 50000,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": -1660.0
+      }
+    }
+  ]
+}

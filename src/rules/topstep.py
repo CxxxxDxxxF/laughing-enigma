@@ -7,12 +7,15 @@ For ambiguous or unclear rules, this implementation returns WARN violations
 with code="TOPSTEP_RULE_UNSPECIFIED" to allow manual review.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 from datetime import date
 
 from .base import Ruleset, RulesViolation, RulesViolationSeverity, RulesetError
 from .drawdown import DrawdownTracker, calculate_portfolio_equity
+
+if TYPE_CHECKING:
+    from .day_boundary import TradingDayBoundary
 
 
 @dataclass
@@ -39,6 +42,70 @@ class TopstepRulesConfig:
     max_daily_loss: Optional[float] = None
     max_trailing_drawdown_pct: Optional[float] = None
     account_size: Optional[float] = None
+    
+    @classmethod
+    def for_combine(
+        cls,
+        max_turnover_pct: Optional[float] = None,
+        max_position_size: Optional[float] = None,
+        max_daily_loss: Optional[float] = None,
+        max_trailing_drawdown_pct: Optional[float] = None,
+        account_size: Optional[float] = None
+    ) -> 'TopstepRulesConfig':
+        """Create TopstepRulesConfig for COMBINE account type.
+        
+        COMBINE accounts use static limits from config.
+        All limits are enforced based on the provided values.
+        
+        Args:
+            max_turnover_pct: Maximum turnover as % of account
+            max_position_size: Maximum position size in units
+            max_daily_loss: Maximum daily loss in absolute terms (must be negative)
+            max_trailing_drawdown_pct: Maximum trailing drawdown as % of high-water mark
+            account_size: Account size for percentage calculations
+            
+        Returns:
+            TopstepRulesConfig instance configured for COMBINE
+        """
+        return cls(
+            max_turnover_pct=max_turnover_pct,
+            max_position_size=max_position_size,
+            max_daily_loss=max_daily_loss,
+            max_trailing_drawdown_pct=max_trailing_drawdown_pct,
+            account_size=account_size
+        )
+    
+    @classmethod
+    def for_live_funded(
+        cls,
+        max_turnover_pct: Optional[float] = None,
+        max_position_size: Optional[float] = None,
+        max_daily_loss: Optional[float] = None,
+        account_size: Optional[float] = None
+    ) -> 'TopstepRulesConfig':
+        """Create TopstepRulesConfig for LIVE_FUNDED account type.
+        
+        LIVE_FUNDED accounts:
+        - Use live_daily_loss_limit from broker (not max_daily_loss from config)
+        - Do NOT enforce trailing drawdown (no max_trailing_drawdown_pct)
+        - All other limits are enforced based on provided values
+        
+        Args:
+            max_turnover_pct: Maximum turnover as % of account
+            max_position_size: Maximum position size in units
+            max_daily_loss: Ignored (LIVE_FUNDED uses live_daily_loss_limit from broker)
+            account_size: Account size for percentage calculations
+            
+        Returns:
+            TopstepRulesConfig instance configured for LIVE_FUNDED
+        """
+        return cls(
+            max_turnover_pct=max_turnover_pct,
+            max_position_size=max_position_size,
+            max_daily_loss=max_daily_loss,  # Ignored for LIVE_FUNDED, but kept for API compatibility
+            max_trailing_drawdown_pct=None,  # LIVE_FUNDED does not enforce trailing drawdown
+            account_size=account_size
+        )
     
     def __post_init__(self):
         """Validate config."""
@@ -153,7 +220,8 @@ class TopstepRuleset(Ruleset):
         execution_engine: Optional[Any] = None,
         current_prices: Optional[Dict[str, float]] = None,
         day_boundary: Optional['TradingDayBoundary'] = None,
-        skip_equity_recalculation: bool = False  # Phase 15: when True, use precomputed equity from tracker
+        skip_equity_recalculation: bool = False,  # Phase 15: when True, use precomputed equity from tracker
+        live_daily_loss_limit: Optional[float] = None  # LIVE_FUNDED: live daily loss limit from broker (overrides config)
     ) -> List[RulesViolation]:
         """Validate execution results against Topstep rules.
         
@@ -174,6 +242,27 @@ class TopstepRuleset(Ruleset):
         violations: List[RulesViolation] = []
         
         try:
+            # Determine account type: LIVE_FUNDED has max_trailing_drawdown_pct=None
+            is_live_funded = self.config.max_trailing_drawdown_pct is None
+            
+            # LIVE_FUNDED: Must have live_daily_loss_limit from broker
+            if is_live_funded:
+                if live_daily_loss_limit is None:
+                    raise RulesetError(
+                        "LIVE_FUNDED account requires live_daily_loss_limit parameter from broker"
+                    )
+            
+            # COMBINE: Must have static limits configured
+            if not is_live_funded:
+                if self.config.max_daily_loss is None:
+                    raise RulesetError(
+                        "COMBINE account requires max_daily_loss to be configured"
+                    )
+                if self.config.max_trailing_drawdown_pct is None:
+                    raise RulesetError(
+                        "COMBINE account requires max_trailing_drawdown_pct to be configured"
+                    )
+            
             if execution_engine is None:
                 # Cannot validate without execution engine
                 return violations
@@ -213,6 +302,10 @@ class TopstepRuleset(Ruleset):
                     realized_pnl=total_realized_pnl
                 )
             
+            # LIVE_FUNDED: Equity zero or negative must halt
+            # Note: This check happens after equity calculation but before tracker update
+            # to catch zero/negative equity early
+            
             # Initialize or update drawdown tracker
             if drawdown_tracker is None:
                 # Initialize new tracker for this session/day
@@ -248,6 +341,16 @@ class TopstepRuleset(Ruleset):
                 else:
                     snapshot = None
             
+            # LIVE_FUNDED: Equity zero or negative must halt
+            if is_live_funded and equity <= 0.0:
+                violations.append(RulesViolation(
+                    code="TOPSTEP_MAXIMUM_LOSS_LIMIT_EXCEEDED",
+                    message=f"LIVE_FUNDED account equity is zero or negative: {equity:.2f}",
+                    severity=RulesViolationSeverity.HALT,
+                    metadata={"equity": equity}
+                ))
+                # Continue to return violations (don't return early, let all checks run)
+            
             # Invariant check: Once locked, is_locked must never revert to false
             if drawdown_tracker.is_locked == False and current_state.drawdown_tracker and current_state.drawdown_tracker.is_locked:
                 violations.append(RulesViolation(
@@ -280,8 +383,9 @@ class TopstepRuleset(Ruleset):
                         }
                     ))
             
-            # Check max_trailing_drawdown_pct
-            if self.config.max_trailing_drawdown_pct is not None:
+            # Check max_trailing_drawdown_pct (only for COMBINE, not LIVE_FUNDED)
+            # LIVE_FUNDED accounts do not enforce trailing drawdown
+            if not is_live_funded and self.config.max_trailing_drawdown_pct is not None:
                 if snapshot.state.value == "locked" and snapshot.trailing_drawdown_pct > self.config.max_trailing_drawdown_pct:
                     violations.append(RulesViolation(
                         code="TOPSTEP_MAX_TRAILING_DRAWDOWN_EXCEEDED",

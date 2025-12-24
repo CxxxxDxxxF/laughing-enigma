@@ -153,7 +153,7 @@ class TestArchitecturalInvariants(TestCase):
         
         Rulesets receive live_daily_loss_limit as a parameter, not from imports.
         """
-        ruleset = TopstepRuleset(TopstepRulesConfig(account_type="LIVE_FUNDED"))
+        ruleset = TopstepRuleset(TopstepRulesConfig.for_live_funded())
         
         # Check that validate_execution accepts live_daily_loss_limit parameter
         sig = inspect.signature(ruleset.validate_execution)
@@ -412,7 +412,7 @@ class TestArchitecturalInvariants(TestCase):
         from datetime import datetime, date, time
         import zoneinfo
         
-        config = TopstepRulesConfig(account_type="LIVE_FUNDED")
+        config = TopstepRulesConfig.for_live_funded()
         ruleset = TopstepRuleset(config)
         
         ct_tz = zoneinfo.ZoneInfo("America/Chicago")
@@ -475,7 +475,7 @@ class TestArchitecturalInvariants(TestCase):
         from datetime import datetime, date, time
         import zoneinfo
         
-        config = TopstepRulesConfig(account_type="LIVE_FUNDED")
+        config = TopstepRulesConfig.for_live_funded()
         ruleset = TopstepRuleset(config)
         
         ct_tz = zoneinfo.ZoneInfo("America/Chicago")
@@ -548,7 +548,7 @@ class TestArchitecturalInvariants(TestCase):
         from datetime import datetime, date, time
         import zoneinfo
         
-        config = TopstepRulesConfig(account_type="LIVE_FUNDED")
+        config = TopstepRulesConfig.for_live_funded()
         ruleset = TopstepRuleset(config)
         
         ct_tz = zoneinfo.ZoneInfo("America/Chicago")
@@ -697,8 +697,7 @@ class TestArchitecturalInvariants(TestCase):
         import zoneinfo
         
         # COMBINE config with static limits
-        config = TopstepRulesConfig(
-            account_type="COMBINE",
+        config = TopstepRulesConfig.for_combine(
             max_daily_loss=-1000.0,  # Static limit
             max_trailing_drawdown_pct=5.0,
             account_size=50000.0
@@ -767,8 +766,7 @@ class TestArchitecturalInvariants(TestCase):
         import zoneinfo
         
         # COMBINE without max_daily_loss must fail in validate_execution
-        config = TopstepRulesConfig(
-            account_type="COMBINE",
+        config = TopstepRulesConfig.for_combine(
             max_daily_loss=None,  # Missing
             max_trailing_drawdown_pct=5.0,
             account_size=50000.0
@@ -833,8 +831,7 @@ class TestArchitecturalInvariants(TestCase):
         from datetime import datetime, date, time
         import zoneinfo
         
-        config = TopstepRulesConfig(
-            account_type="COMBINE",
+        config = TopstepRulesConfig.for_combine(
             max_daily_loss=-1000.0,
             max_trailing_drawdown_pct=5.0,
             account_size=50000.0
