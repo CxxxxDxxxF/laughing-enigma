@@ -366,16 +366,24 @@ class TopstepRuleset(Ruleset):
                 ))
             
             # Check max_daily_loss
-            if self.config.max_daily_loss is not None:
+            # LIVE_FUNDED: Use live_daily_loss_limit from broker (overrides config)
+            # COMBINE: Use max_daily_loss from config
+            daily_loss_limit = None
+            if is_live_funded:
+                daily_loss_limit = live_daily_loss_limit  # LIVE_FUNDED uses injected limit
+            else:
+                daily_loss_limit = self.config.max_daily_loss  # COMBINE uses config limit
+            
+            if daily_loss_limit is not None:
                 daily_loss = snapshot.equity - snapshot.initial_balance
-                if daily_loss <= self.config.max_daily_loss:
+                if daily_loss <= daily_loss_limit:
                     violations.append(RulesViolation(
                         code="TOPSTEP_MAX_DAILY_LOSS_EXCEEDED",
-                        message=f"Daily loss {daily_loss:.2f} exceeds maximum {self.config.max_daily_loss:.2f}",
+                        message=f"Daily loss {daily_loss:.2f} exceeds maximum {daily_loss_limit:.2f}",
                         severity=RulesViolationSeverity.HALT,
                         metadata={
                             "daily_loss": daily_loss,
-                            "max_daily_loss": self.config.max_daily_loss,
+                            "max_daily_loss": daily_loss_limit,
                             "equity": snapshot.equity,
                             "initial_balance": snapshot.initial_balance,
                             "realized_pnl": total_realized_pnl,

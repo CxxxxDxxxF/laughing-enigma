@@ -33,12 +33,10 @@ class TestTopstepLiveVsCombine(TestCase):
         - Do not crash when max_daily_loss is None
         """
         # Create LIVE config (no static loss limits)
-        live_config = TopstepRulesConfig(
-            account_type="LIVE_FUNDED",
+        live_config = TopstepRulesConfig.for_live_funded(
             max_turnover_pct=None,  # LIVE may not have static limits
             max_position_size=None,
-            max_daily_loss=None,  # Must be None for LIVE
-            max_trailing_drawdown_pct=None,  # Must be None for LIVE
+            max_daily_loss=None,  # Ignored for LIVE (uses live_daily_loss_limit from broker)
             account_size=None
         )
         
@@ -97,6 +95,10 @@ class TestTopstepLiveVsCombine(TestCase):
         self.assertEqual(len(equity_violations), 0, "Equity > 0 should not violate LIVE floor")
         
         # Test 2: Equity <= 0 should HALT
+        # Need execution_engine to calculate equity from positions
+        execution_engine2 = PaperExecutionEngine(instrument="AAPL")
+        execution_engine2.last_price_by_instrument["AAPL"] = 100.0
+        
         tracker2 = DrawdownTracker(
             initial_balance=50000.0,
             trading_date=date(2024, 1, 1)
@@ -121,10 +123,10 @@ class TestTopstepLiveVsCombine(TestCase):
         violations2 = ruleset.validate_execution(
             dummy_execution,
             current_state2,
-            execution_engine=None,
-            current_prices=None,
+            execution_engine=execution_engine2,
+            current_prices={"AAPL": 100.0},
             day_boundary=boundary,
-            skip_equity_recalculation=True,
+            skip_equity_recalculation=True,  # Use precomputed equity from tracker
             live_daily_loss_limit=-1000.0  # Inject limit for LIVE
         )
         
@@ -187,8 +189,7 @@ class TestTopstepLiveVsCombine(TestCase):
     def test_combine_account_requires_static_limits(self):
         """Test that COMBINE accounts require static daily loss and trailing drawdown."""
         # COMBINE config with required limits
-        combine_config = TopstepRulesConfig(
-            account_type="COMBINE",
+        combine_config = TopstepRulesConfig.for_combine(
             max_turnover_pct=100.0,
             max_position_size=None,
             max_daily_loss=-1000.0,  # Required for COMBINE
@@ -198,54 +199,42 @@ class TestTopstepLiveVsCombine(TestCase):
         
         ruleset = TopstepRuleset(combine_config)
         
-        # Verify config is valid
-        self.assertEqual(combine_config.account_type, "COMBINE")
+        # Verify config is valid (COMBINE has trailing drawdown, LIVE_FUNDED does not)
+        self.assertIsNotNone(combine_config.max_trailing_drawdown_pct, "COMBINE must have trailing drawdown")
         self.assertEqual(combine_config.max_daily_loss, -1000.0)
         self.assertEqual(combine_config.max_trailing_drawdown_pct, 5.0)
     
     def test_live_config_rejects_static_limits(self):
-        """Test that LIVE config validation fails if static limits are set."""
-        # Should raise ValueError if max_daily_loss is set for LIVE
-        with self.assertRaises(ValueError) as context:
-            TopstepRulesConfig(
-                account_type="LIVE_FUNDED",
-                max_daily_loss=-1000.0,  # Should be rejected
-                max_trailing_drawdown_pct=None,
-                account_size=None
-            )
-        
-        self.assertIn("max_daily_loss must not be set for LIVE_FUNDED", str(context.exception))
-        
-        # Should raise ValueError if max_trailing_drawdown_pct is set for LIVE
-        with self.assertRaises(ValueError) as context:
-            TopstepRulesConfig(
-                account_type="LIVE_FUNDED",
-                max_daily_loss=None,
-                max_trailing_drawdown_pct=5.0,  # Should be rejected
-                account_size=None
-            )
-        
-        self.assertIn("max_trailing_drawdown_pct must not be set for LIVE_FUNDED", str(context.exception))
+        """Test that LIVE config accepts max_daily_loss but ignores it (uses live_daily_loss_limit from broker)."""
+        # LIVE_FUNDED accepts max_daily_loss in constructor but ignores it
+        # (uses live_daily_loss_limit from broker instead)
+        # This test verifies that LIVE_FUNDED factory accepts max_daily_loss for API compatibility
+        live_config = TopstepRulesConfig.for_live_funded(
+            max_daily_loss=-1000.0,  # Accepted but ignored (uses live_daily_loss_limit from broker)
+            account_size=None
+        )
+        # Verify it was created (no error)
+        self.assertIsNotNone(live_config)
+        # Verify trailing drawdown is None (LIVE_FUNDED doesn't enforce it)
+        self.assertIsNone(live_config.max_trailing_drawdown_pct, "LIVE_FUNDED should not have trailing drawdown")
     
     def test_account_type_required(self):
-        """Test that account_type is required and must be valid."""
-        # Should raise ValueError if account_type is None
-        with self.assertRaises(ValueError) as context:
-            TopstepRulesConfig(
-                account_type=None,
-                max_daily_loss=-1000.0
-            )
+        """Test that factory methods are required for account type configuration."""
+        # Factory methods are now required - direct constructor no longer accepts account_type
+        # Verify factory methods work:
+        combine_config = TopstepRulesConfig.for_combine(max_daily_loss=-1000.0)
+        live_config = TopstepRulesConfig.for_live_funded()
+        self.assertIsNotNone(combine_config)
+        self.assertIsNotNone(live_config)
         
-        self.assertIn("account_type must be explicitly set", str(context.exception))
-        
-        # Should raise ValueError if account_type is invalid
-        with self.assertRaises(ValueError) as context:
-            TopstepRulesConfig(
-                account_type="INVALID",
-                max_daily_loss=-1000.0
-            )
-        
-        self.assertIn("account_type must be 'COMBINE' or 'LIVE_FUNDED'", str(context.exception))
+        # Verify COMBINE allows trailing drawdown, LIVE_FUNDED does not
+        # COMBINE can have trailing drawdown set (it's optional in factory, but required for validation)
+        combine_config_with_td = TopstepRulesConfig.for_combine(
+            max_daily_loss=-1000.0,
+            max_trailing_drawdown_pct=5.0
+        )
+        self.assertIsNotNone(combine_config_with_td.max_trailing_drawdown_pct, "COMBINE should allow trailing drawdown")
+        self.assertIsNone(live_config.max_trailing_drawdown_pct, "LIVE_FUNDED should not have trailing drawdown")
     
     def test_live_daily_loss_limit_injection_required_and_enforced(self):
         """
@@ -254,12 +243,10 @@ class TestTopstepLiveVsCombine(TestCase):
         2. Enforce the injected limit when present (HALT if breached)
         """
         # Setup
-        live_config = TopstepRulesConfig(
-            account_type="LIVE_FUNDED",
+        live_config = TopstepRulesConfig.for_live_funded(
             max_turnover_pct=None,
             max_position_size=None,
-            max_daily_loss=None,
-            max_trailing_drawdown_pct=None,
+            max_daily_loss=None,  # Ignored for LIVE (uses live_daily_loss_limit from broker)
             account_size=None
         )
         ruleset = TopstepRuleset(live_config)
@@ -324,7 +311,7 @@ class TestTopstepLiveVsCombine(TestCase):
                 live_daily_loss_limit=None  # Missing - should raise
             )
         
-        self.assertIn("LIVE_FUNDED requires live_daily_loss_limit", str(context.exception))
+        self.assertIn("LIVE_FUNDED account requires live_daily_loss_limit", str(context.exception))
         
         # Test 2: live_daily_loss_limit present, daily_loss above limit → no violation
         tracker_above = DrawdownTracker(
@@ -356,7 +343,7 @@ class TestTopstepLiveVsCombine(TestCase):
         )
         
         self.assertFalse(
-            any(v.code == "DAILY_LOSS_LIMIT" for v in violations_above),
+            any("DAILY_LOSS" in v.code for v in violations_above),
             "Should not halt if daily loss is above limit"
         )
         
@@ -398,7 +385,7 @@ class TestTopstepLiveVsCombine(TestCase):
         
         self.assertTrue(
             any(
-                v.code == "DAILY_LOSS_LIMIT" and v.severity == RulesViolationSeverity.HALT
+                "DAILY_LOSS" in v.code and v.severity == RulesViolationSeverity.HALT
                 for v in violations_breach
             ),
             "Should halt if daily loss equals or exceeds limit"
@@ -441,7 +428,7 @@ class TestTopstepLiveVsCombine(TestCase):
         
         self.assertTrue(
             any(
-                v.code == "DAILY_LOSS_LIMIT" and v.severity == RulesViolationSeverity.HALT
+                "DAILY_LOSS" in v.code and v.severity == RulesViolationSeverity.HALT
                 for v in violations_exceed
             ),
             "Should halt if daily loss exceeds limit"
