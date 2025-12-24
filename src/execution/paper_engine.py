@@ -92,6 +92,10 @@ class PaperExecutionEngine(ExecutionEngine):
         self.fills: Dict[str, List[Fill]] = {}  # order_id -> List[Fill]
         self.positions: Dict[str, Position] = {}  # instrument -> Position
         
+        # Price state (required for mark-to-market without trades)
+        # Must be initialized and updated every cycle when prices are observed
+        self.last_price_by_instrument: Dict[str, float] = {}
+        
         # Daily loss tracking (for max_daily_loss enforcement)
         self.daily_start_value: Optional[float] = None
         self.daily_start_date: Optional[datetime] = None
@@ -296,6 +300,10 @@ class PaperExecutionEngine(ExecutionEngine):
         if timestamp is None:
             timestamp = self.clock.now()
         
+        # Update price state (must happen every cycle, even if order is rejected)
+        # This enables mark-to-market without trades
+        self.last_price_by_instrument[order.instrument] = current_price
+        
         # Validate order state
         if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
             raise ValueError(
@@ -492,14 +500,56 @@ class PaperExecutionEngine(ExecutionEngine):
         """
         return self.fills.get(order_id, [])
     
+    def update_price(self, instrument: str, price: float) -> None:
+        """Update price for an instrument (for mark-to-market without trades).
+        
+        This method must be called every cycle when prices are observed,
+        even if no orders are executed. This enables mark-to-market calculations
+        for existing positions.
+        
+        Args:
+            instrument: Instrument identifier
+            price: Current market price
+            
+        Raises:
+            RuntimeError: If instrument doesn't match engine's configured instrument
+        """
+        if instrument != self.instrument:
+            raise RuntimeError(
+                f"Engine configured for {self.instrument}, cannot update price for {instrument}"
+            )
+        self.last_price_by_instrument[instrument] = price
+    
+    def update_market_prices(self, current_prices: Dict[str, float], timestamp: Optional[datetime] = None) -> None:
+        """Update market prices for all instruments (for mark-to-market without trades).
+        
+        This method must be called every cycle when prices are observed,
+        even if no orders are executed. This enables mark-to-market calculations
+        for existing positions.
+        
+        Args:
+            current_prices: Dictionary mapping instrument -> price
+            timestamp: Optional timestamp (not used, kept for API compatibility)
+            
+        Raises:
+            RuntimeError: If any instrument doesn't match engine's configured instrument
+        """
+        for instrument, price in current_prices.items():
+            if instrument != self.instrument:
+                raise RuntimeError(
+                    f"Engine configured for {self.instrument}, cannot update price for {instrument}"
+                )
+            self.last_price_by_instrument[instrument] = price
+    
     def reset(self) -> None:
         """Reset engine state (for testing/new sessions).
         
-        Clears all orders, positions, and fills.
+        Clears all orders, positions, fills, and prices.
         """
         self.orders.clear()
         self.fills.clear()
         self.positions.clear()
+        self.last_price_by_instrument.clear()
         self.daily_start_value = None
         self.daily_start_date = None
     

@@ -318,6 +318,21 @@ def execute_rebalance_plan(
     # Extract instrument from execution engine (assumes single instrument per engine)
     instrument = execution_engine.instrument
     
+    # Update price state for mark-to-market (even if no trades occur)
+    # Get price for this instrument from price dict
+    instrument_price = None
+    # Try instrument key first, then try strategy keys
+    instrument_price = price_by_strategy_or_instrument.get(instrument)
+    if instrument_price is None:
+        # Try first strategy ID as fallback (assumes single instrument per engine)
+        for key, val in price_by_strategy_or_instrument.items():
+            instrument_price = val
+            break
+    
+    # Update price state if we have a price (enables mark-to-market without trades)
+    if instrument_price is not None:
+        execution_engine.update_price(instrument, instrument_price)
+    
     # Execute each intent (skip HOLD)
     for intent in plan.trade_intents:
         if intent.direction == TradeDirection.HOLD:
