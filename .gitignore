@@ -13,3 +13,4 @@ artifacts/**/runs/
 # Keep config JSON files (they're in version control)
 !configs/*.json
 
+.venv/
