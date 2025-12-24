@@ -91,17 +91,21 @@ class BacktestResult:
         run_id: ID of the run that produced this result
         metrics: Computed metrics from the backtest
         artifact_paths: Dict mapping artifact names to storage paths/URIs
+        raw_returns: Optional RawReturns object (in-memory, for --light-artifacts mode)
+            If provided, evaluator should use this instead of loading from artifacts.
     """
     
     def __init__(
         self,
         run_id: str,
         metrics: Metrics,
-        artifact_paths: Dict[str, str]
+        artifact_paths: Dict[str, str],
+        raw_returns: Optional[Any] = None  # RawReturns type, but avoid circular import
     ):
         self.run_id = run_id
         self.metrics = metrics
         self.artifact_paths = artifact_paths
+        self.raw_returns = raw_returns  # In-memory raw returns for determinism verification
 
 
 class BacktestError(Exception):

@@ -19,6 +19,7 @@ from ..core.artifacts import ArtifactStore
 
 if TYPE_CHECKING:
     from ..lifecycle.runner import ExecutionMode
+    from ..rebalance.planner import CurrentPortfolioState
 
 
 class AllocationError(Exception):
@@ -350,7 +351,10 @@ def allocate_capital(
     config: AllocationConfig,
     allocation_id: Optional[str] = None,
     allocation_timestamp: Optional[datetime] = None,
-    execution_mode: Optional['ExecutionMode'] = None
+    execution_mode: Optional['ExecutionMode'] = None,
+    current_state: Optional['CurrentPortfolioState'] = None,
+    current_cycle_index: Optional[int] = None,
+    strategy_configs: Optional[Dict[str, Dict[str, Any]]] = None
 ) -> AllocationResult:
     """Allocate capital across strategies based on evaluation results.
     
@@ -422,6 +426,31 @@ def allocate_capital(
                 metrics=_compute_allocation_metrics([], config.total_capital, evaluation)
             )
         
+        # Step 2: Enforce timeboxed exits (portfolio-level exit logic)
+        # This is where time-based exits are enforced, not in evaluation emitters.
+        # If a strategy has been held for hold_days, set its target allocation to 0.
+        # This generates a SELL intent via the normal rebalance flow.
+        timeboxed_exit_strategies = set()
+        if current_state is not None and current_cycle_index is not None and strategy_configs is not None:
+            # Check each candidate strategy for timeboxed exit
+            for candidate in candidates:
+                strategy_id = candidate.strategy_id
+                entry_cycle = current_state.get_entry_cycle(strategy_id)
+                
+                if entry_cycle is not None:
+                    # Strategy has an open position - check if timeboxed exit is due
+                    cycles_held = current_cycle_index - entry_cycle
+                    
+                    # Extract hold_days from strategy config
+                    strategy_config = strategy_configs.get(strategy_id, {})
+                    experiment_config = strategy_config.get("experiment_config", {})
+                    strategy_params = experiment_config.get("strategy_params", {})
+                    hold_days = strategy_params.get("hold_days")
+                    
+                    if hold_days is not None and cycles_held >= hold_days:
+                        # Timeboxed exit: mark for zero allocation
+                        timeboxed_exit_strategies.add(strategy_id)
+        
         # Step 2: Compute weights
         raw_weights = _compute_weights(candidates, config.allocation_method)
         
@@ -436,16 +465,26 @@ def allocate_capital(
         )
         
         # Step 5: Compute final allocations
+        # Apply timeboxed exits: set allocation to 0 for strategies that need to exit
         allocations = []
         for i, (result, weight) in enumerate(zip(candidates, constrained_weights)):
-            allocated_capital = weight * config.total_capital
+            strategy_id = result.strategy_id
+            
+            # If strategy needs timeboxed exit, set allocation to 0
+            # This will generate a SELL intent via rebalance (current > 0, target = 0)
+            if strategy_id in timeboxed_exit_strategies:
+                allocated_capital = 0.0
+                allocation_fraction = 0.0
+            else:
+                allocated_capital = weight * config.total_capital
+                allocation_fraction = weight
             
             allocation = PortfolioAllocation(
-                strategy_id=result.strategy_id,
+                strategy_id=strategy_id,
                 experiment_name=result.experiment_name,
                 experiment_version=result.experiment_version,
                 allocated_capital=allocated_capital,
-                allocation_fraction=weight,
+                allocation_fraction=allocation_fraction,
                 robustness_score=result.evaluation_metrics.execution_robustness_score,
                 rank=i + 1  # Rank in filtered list (1-indexed)
             )
@@ -473,7 +512,8 @@ def allocate_capital(
 
 def persist_allocation(
     allocation: AllocationResult,
-    artifact_store: ArtifactStore
+    artifact_store: ArtifactStore,
+    light_artifacts: bool = False
 ) -> str:
     """Persist allocation result to artifact store.
     
@@ -487,6 +527,8 @@ def persist_allocation(
     Raises:
         AllocationError: If persistence fails
     """
+    if light_artifacts:
+        return allocation.allocation_id
     try:
         allocation_json = json.dumps(allocation.to_dict(), indent=2).encode('utf-8')
         artifact_store.store(

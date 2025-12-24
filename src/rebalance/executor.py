@@ -465,7 +465,8 @@ def execute_rebalance_plan(
 
 def persist_rebalance_execution(
     result: RebalanceExecutionResult,
-    artifact_store: ArtifactStore
+    artifact_store: ArtifactStore,
+    light_artifacts: bool = False
 ) -> str:
     """Persist rebalance execution result to artifact store.
     
@@ -479,6 +480,11 @@ def persist_rebalance_execution(
     Raises:
         RebalanceExecutionError: If persistence fails
     """
+    # NOTE: Execution artifacts are ALWAYS written (even in light mode) because they're
+    # required for final trade collection in Layer 2 backtests. Only skip if explicitly
+    # requested AND we have an alternative way to access the data.
+    # For now, we always write execution artifacts to ensure trade collection works.
+    # TODO: Consider storing execution_result in CycleResult for in-memory access
     try:
         # Also get final positions from execution engine
         positions = {}

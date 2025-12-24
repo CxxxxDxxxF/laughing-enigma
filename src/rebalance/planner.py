@@ -48,10 +48,15 @@ class CurrentPortfolioState:
         drawdown_tracker: Optional drawdown tracker for Topstep-style rules
         positions_by_instrument: Dictionary mapping instrument -> Position dict (from Position.to_dict())
             Used for hold-quantity validation mode (Phase 15)
+        strategy_entry_cycles: Dictionary mapping strategy_id -> entry_cycle_index (int)
+            Tracks when each strategy position was opened for timeboxed exit enforcement.
+            Entry cycle index is the cycle number (0-based) when position was opened.
+            None or missing entry means no position is currently open.
         
     Note:
         If strategy_id is not in strategy_allocations, current allocation is 0.
         positions_by_instrument stores Position serialized as dict for persistence.
+        strategy_entry_cycles is used by allocation logic to enforce timeboxed exits.
     """
     
     strategy_allocations: Dict[str, float]
@@ -59,6 +64,7 @@ class CurrentPortfolioState:
     timestamp: datetime
     drawdown_tracker: Optional['DrawdownTracker'] = None
     positions_by_instrument: Optional[Dict[str, Dict[str, Any]]] = None
+    strategy_entry_cycles: Optional[Dict[str, int]] = None
     
     def get_allocation(self, strategy_id: str) -> float:
         """Get current allocation for a strategy.
@@ -82,7 +88,22 @@ class CurrentPortfolioState:
             result["drawdown_tracker"] = self.drawdown_tracker.to_dict()
         if self.positions_by_instrument is not None:
             result["positions_by_instrument"] = self.positions_by_instrument
+        if self.strategy_entry_cycles is not None:
+            result["strategy_entry_cycles"] = self.strategy_entry_cycles
         return result
+    
+    def get_entry_cycle(self, strategy_id: str) -> Optional[int]:
+        """Get entry cycle index for a strategy.
+        
+        Args:
+            strategy_id: Strategy identifier
+            
+        Returns:
+            Entry cycle index (0-based), or None if no position is open
+        """
+        if self.strategy_entry_cycles is None:
+            return None
+        return self.strategy_entry_cycles.get(strategy_id)
 
 
 @dataclass
@@ -550,7 +571,8 @@ def plan_rebalance(
 
 def persist_rebalance_plan(
     plan: RebalancePlan,
-    artifact_store: ArtifactStore
+    artifact_store: ArtifactStore,
+    light_artifacts: bool = False
 ) -> str:
     """Persist rebalance plan to artifact store.
     
@@ -564,6 +586,8 @@ def persist_rebalance_plan(
     Raises:
         RebalanceError: If persistence fails
     """
+    if light_artifacts:
+        return plan.plan_id
     try:
         plan_json = json.dumps(plan.to_dict(), indent=2).encode('utf-8')
         artifact_store.store(plan.plan_id, "rebalance_plan.json", plan_json)

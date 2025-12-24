@@ -302,7 +302,8 @@ def evaluate_strategy(
     execution_engine: PaperExecutionEngine,
     artifact_store: ArtifactStore,
     price_series: Optional[List[float]] = None,
-    evaluation_criteria: Optional[Dict[str, Any]] = None
+    evaluation_criteria: Optional[Dict[str, Any]] = None,
+    light_artifacts: bool = False
 ) -> EvaluationResult:
     """Evaluate a single strategy by running backtest, paper trading, and divergence analysis.
     
@@ -346,9 +347,10 @@ def evaluate_strategy(
         run_id = f"{strategy_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # Step 1: Run backtest
-        backtest_result = research_engine.run_backtest(experiment, run_id, inputs)
+        backtest_result = research_engine.run_backtest(experiment, run_id, inputs, light_artifacts=light_artifacts)
         
         # Step 2: Load raw returns from artifacts
+        # Note: raw_returns.json is always written (even in light mode) because it's required for evaluation
         raw_returns_data = artifact_store.retrieve(run_id, "raw_returns.json")
         if not raw_returns_data:
             raise EvaluationError(f"Failed to retrieve raw returns for run {run_id}")
@@ -363,11 +365,15 @@ def evaluate_strategy(
         
         # Step 3: Execute signals in paper trading
         instrument = inputs["instrument"]
+        strategy_type = inputs.get("strategy_type", "buy_hold")
+        strategy_params = experiment.config.get("strategy_params", {})
         execution_results = execute_signals_from_raw_returns(
             raw_returns=raw_returns,
             instrument=instrument,
             execution_engine=execution_engine,
-            price_series=price_series
+            price_series=price_series,
+            strategy_type=strategy_type,
+            strategy_params=strategy_params
         )
         
         paper_session_id = execution_engine.session_id
@@ -491,7 +497,8 @@ def compare_strategies(
 
 def persist_evaluation(
     evaluation: StrategyEvaluation,
-    artifact_store: ArtifactStore
+    artifact_store: ArtifactStore,
+    light_artifacts: bool = False
 ) -> str:
     """Persist strategy evaluation to artifact store.
     
@@ -502,6 +509,8 @@ def persist_evaluation(
     Returns:
         Evaluation identifier
     """
+    if light_artifacts:
+        return evaluation.evaluation_id
     try:
         evaluation_json = json.dumps(evaluation.to_dict(), indent=2).encode('utf-8')
         artifact_store.store(

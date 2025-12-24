@@ -158,12 +158,16 @@ class LocalPortfolioStateStore(PortfolioStateStore):
             # Load positions if present
             positions_by_instrument = data.get("positions_by_instrument")
             
+            # Load strategy entry cycles if present (for timeboxed exit tracking)
+            strategy_entry_cycles = data.get("strategy_entry_cycles")
+            
             return CurrentPortfolioState(
                 strategy_allocations=data["strategy_allocations"],
                 total_capital=data["total_capital"],
                 timestamp=datetime.fromisoformat(data["timestamp"]),
                 drawdown_tracker=drawdown_tracker,
-                positions_by_instrument=positions_by_instrument
+                positions_by_instrument=positions_by_instrument,
+                strategy_entry_cycles=strategy_entry_cycles
             )
             
         except Exception as e:

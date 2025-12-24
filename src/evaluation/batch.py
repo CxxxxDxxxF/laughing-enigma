@@ -264,7 +264,8 @@ def run_batch_evaluation(
     research_engine: SimpleResearchEngine,
     artifact_store: ArtifactStore,
     execution_engine_factory: Callable[[], PaperExecutionEngine],
-    batch_id: Optional[str] = None
+    batch_id: Optional[str] = None,
+    light_artifacts: bool = False
 ) -> StrategyEvaluation:
     """Run batch evaluation of multiple strategies.
     
@@ -337,7 +338,8 @@ def run_batch_evaluation(
                 execution_engine=execution_engine,
                 artifact_store=artifact_store,
                 price_series=config.price_series,
-                evaluation_criteria=config.evaluation_criteria
+                evaluation_criteria=config.evaluation_criteria,
+                light_artifacts=light_artifacts
             )
             
             evaluation_results.append(result)
@@ -370,7 +372,8 @@ def run_batch_evaluation(
         evaluation=evaluation,
         config=config,
         errors=errors,
-        artifact_store=artifact_store
+        artifact_store=artifact_store,
+        light_artifacts=light_artifacts
     )
     
     return evaluation
@@ -381,7 +384,8 @@ def _persist_batch_artifacts(
     evaluation: StrategyEvaluation,
     config: BatchEvaluationConfig,
     errors: List[Dict[str, Any]],
-    artifact_store: ArtifactStore
+    artifact_store: ArtifactStore,
+    light_artifacts: bool = False
 ) -> None:
     """Persist batch evaluation artifacts.
     
@@ -417,34 +421,35 @@ def _persist_batch_artifacts(
         "errors": errors,
     }
     
-    batch_summary_json = json.dumps(batch_summary, indent=2).encode('utf-8')
-    artifact_store.store(batch_id, "batch_summary.json", batch_summary_json)
-    
-    # Results index
-    results_index = {
-        "batch_id": batch_id,
-        "evaluation_timestamp": evaluation.evaluation_timestamp.isoformat(),
-        "results": [
-            {
-                "strategy_id": r.strategy_id,
-                "experiment_name": r.experiment_name,
-                "experiment_version": r.experiment_version,
-                "backtest_run_id": r.backtest_result.run_id,
-                "paper_session_id": r.paper_session_id,
-                "passed": r.passed,
-                "robustness_score": r.evaluation_metrics.execution_robustness_score,
-                "failure_reasons": r.failure_reasons,
-            }
-            for r in evaluation.results
-        ],
-    }
-    
-    results_index_json = json.dumps(results_index, indent=2).encode('utf-8')
-    artifact_store.store(batch_id, "results_index.json", results_index_json)
-    
-    # Full evaluation (for detailed analysis)
-    from .evaluator import persist_evaluation
-    persist_evaluation(evaluation, artifact_store)
+    if not light_artifacts:
+        batch_summary_json = json.dumps(batch_summary, indent=2).encode('utf-8')
+        artifact_store.store(batch_id, "batch_summary.json", batch_summary_json)
+        
+        # Results index
+        results_index = {
+            "batch_id": batch_id,
+            "evaluation_timestamp": evaluation.evaluation_timestamp.isoformat(),
+            "results": [
+                {
+                    "strategy_id": r.strategy_id,
+                    "experiment_name": r.experiment_name,
+                    "experiment_version": r.experiment_version,
+                    "backtest_run_id": r.backtest_result.run_id,
+                    "paper_session_id": r.paper_session_id,
+                    "passed": r.passed,
+                    "robustness_score": r.evaluation_metrics.execution_robustness_score,
+                    "failure_reasons": r.failure_reasons,
+                }
+                for r in evaluation.results
+            ],
+        }
+        
+        results_index_json = json.dumps(results_index, indent=2).encode('utf-8')
+        artifact_store.store(batch_id, "results_index.json", results_index_json)
+        
+        # Full evaluation (for detailed analysis)
+        from .evaluator import persist_evaluation
+        persist_evaluation(evaluation, artifact_store, light_artifacts=light_artifacts)
 
 
 def main():

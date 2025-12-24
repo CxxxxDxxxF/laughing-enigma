@@ -204,7 +204,8 @@ class SimpleResearchEngine(BaseResearchEngine):
         self,
         experiment: Experiment,
         run_id: str,
-        inputs: Dict[str, Any]
+        inputs: Dict[str, Any],
+        light_artifacts: bool = False
     ) -> BacktestResult:
         """Execute deterministic backtest.
         
@@ -250,14 +251,25 @@ class SimpleResearchEngine(BaseResearchEngine):
         metrics = Metrics.compute(run_id, raw_returns)
         
         # Persist artifacts if store is available
+        # NOTE: raw_returns.json is ALWAYS written (even in light mode) because it's required
+        # for evaluation to work. Only skip metrics.json and run_metadata.json in light mode.
         artifact_paths = {}
         if self.artifact_store is not None:
-            artifact_paths = self._persist_artifacts(run_id, raw_returns, metrics, experiment, inputs)
+            if not light_artifacts:
+                # Full mode: write all artifacts
+                artifact_paths = self._persist_artifacts(run_id, raw_returns, metrics, experiment, inputs)
+            else:
+                # Light mode: only write raw_returns.json (required for evaluation)
+                raw_returns_json = json.dumps(raw_returns.to_dict(), indent=2).encode('utf-8')
+                artifact_paths["raw_returns"] = self.artifact_store.store(
+                    run_id, "raw_returns.json", raw_returns_json
+                )
         
         return BacktestResult(
             run_id=run_id,
             metrics=metrics,
-            artifact_paths=artifact_paths
+            artifact_paths=artifact_paths,
+            raw_returns=raw_returns  # Include in-memory for --light-artifacts mode
         )
     
     def _generate_deterministic_returns(

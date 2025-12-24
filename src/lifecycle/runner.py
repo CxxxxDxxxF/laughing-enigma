@@ -570,6 +570,7 @@ class CycleResult:
     ruleset_type: Optional[str] = None
     ruleset_config: Optional[Dict[str, Any]] = None
     survivability_control_events: List[Dict[str, Any]] = None  # List of ControlEvent dicts
+    execution_result: Optional['RebalanceExecutionResult'] = None  # Forward reference, defined in rebalance.executor
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
@@ -600,7 +601,8 @@ def run_portfolio_cycle(
     state_store: Optional[PortfolioStateStore] = None,
     cycle_id: Optional[str] = None,
     execution_mode: ExecutionMode = ExecutionMode.SIMULATION,
-    cycle_timestamp: Optional[datetime] = None
+    cycle_timestamp: Optional[datetime] = None,
+    light_artifacts: bool = False
 ) -> CycleResult:
     # Step 0: Debug print - verify flags are being read
     print(f"RUN_CYCLE cycle_id={config.cycle_id or cycle_id} hold={config.validation_hold_quantity} bootstrap={config.validation_bootstrap_first_cycle}")
@@ -694,7 +696,8 @@ def run_portfolio_cycle(
                         total_capital=current_state.total_capital,
                         timestamp=current_state.timestamp,  # Preserve original state timestamp
                         drawdown_tracker=current_state.drawdown_tracker,  # Preserve tracker
-                        positions_by_instrument=current_state.positions_by_instrument  # Preserve positions
+                        positions_by_instrument=current_state.positions_by_instrument,  # Preserve positions
+                        strategy_entry_cycles=current_state.strategy_entry_cycles  # Preserve entry cycles
                     ),
                     state_id=f"{cycle_id}_before"  # Use cycle_id prefix for unique ID
                 )
@@ -723,12 +726,13 @@ def run_portfolio_cycle(
                         state_before_id=state_before_id,
                         state_after_id=None,
                         summary={},
-                    status="halted",
-                    skip_reason=f"Time reversal detected: cycle timestamp {cycle_timestamp.isoformat()} < last state timestamp {current_state.timestamp.isoformat()}",
-                    rules_violations=violations,
-                    ruleset_type=config.ruleset_type,
-                    ruleset_config=config.ruleset_config,
-                    survivability_control_events=[],
+                        status="halted",
+                        skip_reason=f"Time reversal detected: cycle timestamp {cycle_timestamp.isoformat()} < last state timestamp {current_state.timestamp.isoformat()}",
+                        rules_violations=violations,
+                        ruleset_type=config.ruleset_type,
+                        ruleset_config=config.ruleset_config,
+                        survivability_control_events=[],
+                        execution_result=None,
                     )
                     if _is_live_mode(execution_mode):
                         # Write halt flag before raising exception
@@ -789,6 +793,7 @@ def run_portfolio_cycle(
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
+                    execution_result=None,
                 )
         
         # Initialize current state if not loaded
@@ -797,7 +802,8 @@ def run_portfolio_cycle(
                 strategy_allocations={},
                 total_capital=config.allocation_config.total_capital,
                 timestamp=cycle_timestamp,
-                positions_by_instrument=None
+                positions_by_instrument=None,
+                strategy_entry_cycles=None
             )
             if state_store:
                 state_before_id = state_store.save_state(config.portfolio_id, current_state)
@@ -821,7 +827,8 @@ def run_portfolio_cycle(
                 config=config.evaluation_config,
                 research_engine=research_engine,
                 artifact_store=artifact_store,
-                execution_engine_factory=execution_engine_factory
+                execution_engine_factory=execution_engine_factory,
+                light_artifacts=light_artifacts
             )
             evaluation_id = evaluation.evaluation_id
         
@@ -835,12 +842,40 @@ def run_portfolio_cycle(
             # In LIVE mode, all timestamps (allocation, plan, execution) must come from
             # a single source of truth (cycle_timestamp) to avoid clock skew.
             # Do not independently supply timestamps from different clocks.
+            # Extract cycle index from cycle_id for timeboxed exit tracking
+            # Cycle IDs are expected to be in format: "prefix_cycle_NNN" or "prefix_cycle_N"
+            current_cycle_index = None
+            if cycle_id:
+                try:
+                    # Try to extract cycle number from cycle_id (e.g., "layer2_es_cycle_001" -> 0, "cycle_042" -> 41)
+                    parts = cycle_id.split("_")
+                    for i, part in enumerate(parts):
+                        if part == "cycle" and i + 1 < len(parts):
+                            cycle_num_str = parts[i + 1].lstrip("0") or "0"
+                            current_cycle_index = int(cycle_num_str) - 1  # Convert to 0-based index
+                            break
+                except (ValueError, IndexError):
+                    # If extraction fails, cycle_index remains None (timeboxed exits won't work)
+                    pass
+            
+            # Build strategy configs dict for timeboxed exit logic
+            strategy_configs = {}
+            if config.evaluation_config and config.evaluation_config.strategies:
+                for strategy_config in config.evaluation_config.strategies:
+                    strategy_configs[strategy_config.strategy_id] = {
+                        "experiment_config": strategy_config.experiment_config,
+                        "inputs": strategy_config.inputs
+                    }
+            
             allocation_result = allocate_capital(
                 evaluation=evaluation,
                 config=config.allocation_config,
                 allocation_id=allocation_id_param,
                 allocation_timestamp=cycle_timestamp,  # Derived from cycle_timestamp
-                execution_mode=execution_mode
+                execution_mode=execution_mode,
+                current_state=current_state,  # Pass current state for timeboxed exit checks
+                current_cycle_index=current_cycle_index,  # Pass cycle index for timeboxed exit checks
+                strategy_configs=strategy_configs  # Pass strategy configs to extract hold_days
             )
         
         # Check allocation guardrails (skip if hold-quantity mode)
@@ -854,7 +889,7 @@ def run_portfolio_cycle(
             if not passes:
                 # Halt cycle
                 from ..allocation.allocator import persist_allocation
-                allocation_id = persist_allocation(allocation_result, artifact_store)
+                allocation_id = persist_allocation(allocation_result, artifact_store, light_artifacts=light_artifacts)
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -879,6 +914,7 @@ def run_portfolio_cycle(
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
+                    execution_result=None,
                 )
                 if _is_live_mode(execution_mode):
                     # Write halt flag before raising exception
@@ -899,7 +935,7 @@ def run_portfolio_cycle(
         
         if use_normal_cycle:
             from ..allocation.allocator import persist_allocation
-            allocation_id = persist_allocation(allocation_result, artifact_store)
+            allocation_id = persist_allocation(allocation_result, artifact_store, light_artifacts=light_artifacts)
             
             # Step 2.5: Apply survivability controls (clamp allocations to position size limits)
             survivability_control_events: List[Dict[str, Any]] = []
@@ -949,7 +985,7 @@ def run_portfolio_cycle(
                     survivability_control_events = [e.to_dict() for e in control_events]
                     
                     # Repersist adjusted allocation
-                    allocation_id = persist_allocation(allocation_result, artifact_store)
+                    allocation_id = persist_allocation(allocation_result, artifact_store, light_artifacts=light_artifacts)
         
         # Step 3: Rebalance planning (skip if hold-quantity mode)
         rebalance_plan = None
@@ -978,7 +1014,7 @@ def run_portfolio_cycle(
             if not passes:
                 # Halt cycle
                 from ..rebalance.planner import persist_rebalance_plan
-                rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
+                rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store, light_artifacts=light_artifacts)
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -1004,6 +1040,7 @@ def run_portfolio_cycle(
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
+                    execution_result=None,
                 )
                 if _is_live_mode(execution_mode):
                     # Write halt flag before raising exception
@@ -1024,7 +1061,7 @@ def run_portfolio_cycle(
         
         if use_normal_cycle:
             from ..rebalance.planner import persist_rebalance_plan
-            rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
+            rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store, light_artifacts=light_artifacts)
         
         # Step 3.5: Validate rebalance plan against ruleset (skip if hold-quantity mode)
         if use_normal_cycle and config.ruleset_type == "topstep" and config.ruleset_config:
@@ -1062,6 +1099,7 @@ def run_portfolio_cycle(
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
+                    execution_result=execution_result,  # Store even for halted cycles
                 )
                 if _is_live_mode(execution_mode):
                     # Write halt flag before raising exception
@@ -1138,7 +1176,7 @@ def run_portfolio_cycle(
             if not passes:
                 # Halt cycle (but execution already happened)
                 from ..rebalance.executor import persist_rebalance_execution
-                rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+                rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store, light_artifacts=light_artifacts)
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -1185,7 +1223,12 @@ def run_portfolio_cycle(
         
         if use_normal_cycle:
             from ..rebalance.executor import persist_rebalance_execution
-            rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+            # Only persist if not in light_artifacts mode (performance optimization)
+            if not light_artifacts:
+                rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+            else:
+                # In light mode, don't persist but still track execution_id for reference
+                rebalance_execution_id = execution_result.execution_id if execution_result else None
         
         # Step 4.5: Validate execution against ruleset (or mark-to-market validation for hold-quantity mode)
         # Initialize ruleset if configured
@@ -1491,6 +1534,7 @@ def run_portfolio_cycle(
                     ruleset_type=config.ruleset_type,
                     ruleset_config=config.ruleset_config,
                     survivability_control_events=[],
+                    execution_result=execution_result,  # Store even for halted cycles
                 )
                 if _is_live_mode(execution_mode):
                     # Write halt flag before raising exception
@@ -1534,13 +1578,40 @@ def run_portfolio_cycle(
                         for instrument, pos in execution_engine.positions.items()
                     }
                 
-                # Create new state with target allocations, drawdown tracker, and positions
+                # Track entry cycles for timeboxed exit enforcement
+                # This is where portfolio-level exit timing is enforced, not in evaluation emitters.
+                # When a strategy position opens (allocation goes from 0 to >0), record entry cycle.
+                # When a strategy position closes (allocation goes from >0 to 0), clear entry cycle.
+                strategy_entry_cycles = {}
+                if current_state and current_state.strategy_entry_cycles:
+                    strategy_entry_cycles = current_state.strategy_entry_cycles.copy()
+                
+                # Update entry cycles based on allocation changes
+                for strategy_id, new_allocation in new_allocations.items():
+                    old_allocation = current_state.get_allocation(strategy_id) if current_state else 0.0
+                    
+                    if old_allocation == 0.0 and new_allocation > 0.0:
+                        # Position opened: record entry cycle
+                        if current_cycle_index is not None:
+                            strategy_entry_cycles[strategy_id] = current_cycle_index
+                    elif old_allocation > 0.0 and new_allocation == 0.0:
+                        # Position closed: clear entry cycle
+                        strategy_entry_cycles.pop(strategy_id, None)
+                    # If allocation stays >0, keep existing entry cycle (if any)
+                
+                # Also clear entry cycles for strategies that are no longer in new_allocations
+                strategies_to_remove = set(strategy_entry_cycles.keys()) - set(new_allocations.keys())
+                for strategy_id in strategies_to_remove:
+                    strategy_entry_cycles.pop(strategy_id, None)
+                
+                # Create new state with target allocations, drawdown tracker, positions, and entry cycles
                 new_state = CurrentPortfolioState(
                     strategy_allocations=new_allocations,
                     total_capital=allocation_result.total_capital,
                     timestamp=cycle_timestamp,
                     drawdown_tracker=drawdown_tracker,
-                    positions_by_instrument=positions_by_instrument
+                    positions_by_instrument=positions_by_instrument,
+                    strategy_entry_cycles=strategy_entry_cycles if strategy_entry_cycles else None
                 )
             else:
                 # Hold-quantity mode: Preserve positions, update drawdown tracker, persist computed equity
@@ -1564,7 +1635,8 @@ def run_portfolio_cycle(
                     total_capital=computed_equity_for_state,  # Phase 15: persist computed equity
                     timestamp=cycle_timestamp,
                     drawdown_tracker=drawdown_tracker,
-                    positions_by_instrument=current_state.positions_by_instrument  # Preserve positions
+                    positions_by_instrument=current_state.positions_by_instrument,  # Preserve positions
+                    strategy_entry_cycles=current_state.strategy_entry_cycles  # Preserve entry cycles
                 )
             
             state_after_id = state_store.save_state(
@@ -1613,6 +1685,7 @@ def run_portfolio_cycle(
             ruleset_type=config.ruleset_type,
             ruleset_config=config.ruleset_config,
             survivability_control_events=survivability_control_events,
+            execution_result=execution_result,  # Store in-memory for light_artifacts mode (determinism verification)
         )
         
     except Exception as e:
@@ -1621,7 +1694,8 @@ def run_portfolio_cycle(
 
 def persist_cycle_result(
     result: CycleResult,
-    artifact_store: ArtifactStore
+    artifact_store: ArtifactStore,
+    light_artifacts: bool = False
 ) -> str:
     """Persist cycle result to artifact store.
     
@@ -1635,6 +1709,8 @@ def persist_cycle_result(
     Raises:
         CycleError: If persistence fails
     """
+    if light_artifacts:
+        return result.cycle_id
     try:
         result_json = json.dumps(result.to_dict(), indent=2).encode('utf-8')
         artifact_store.store(result.cycle_id, "cycle_result.json", result_json)
@@ -1740,7 +1816,9 @@ Example cycle_config.json:
         )
         
         # Persist cycle result
-        cycle_id = persist_cycle_result(result, artifact_store)
+        # Note: light_artifacts is not available in this context (run_cycles function)
+        # This is only called from test/example code, so default to False
+        cycle_id = persist_cycle_result(result, artifact_store, light_artifacts=False)
         
         # Print summary
         print(f"Portfolio cycle complete: {cycle_id}")

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from ..execution import PaperExecutionEngine, ExecutionEngine
     from ..core.experiment import Experiment
 from .simple_emitter import SimpleSignalEmitter
+from .timeboxed_trend_emitter import TimeboxedTrendEmitter
 from .simple_adapter import SimpleSignalAdapter, AdapterConfig
 from .simple_consumer import SimpleSignalConsumer
 from .adapter import InvalidSignalError, RiskCheckError
@@ -168,7 +169,9 @@ def execute_signals_from_raw_returns(
     execution_engine: 'PaperExecutionEngine',
     price_series: Optional[List[float]] = None,
     emitter: Optional[SimpleSignalEmitter] = None,
-    adapter_config: Optional[AdapterConfig] = None
+    adapter_config: Optional[AdapterConfig] = None,
+    strategy_type: Optional[str] = None,
+    strategy_params: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Execute signals from raw returns data.
     
@@ -179,8 +182,10 @@ def execute_signals_from_raw_returns(
         instrument: Instrument identifier
         execution_engine: Paper execution engine
         price_series: Optional list of prices for execution (one per signal day)
-        emitter: Optional signal emitter (default: SimpleSignalEmitter)
+        emitter: Optional signal emitter (default: based on strategy_type)
         adapter_config: Optional adapter configuration
+        strategy_type: Optional strategy type to select emitter ("buy_hold", "timeboxed_trend_v1")
+        strategy_params: Optional strategy parameters (for timeboxed_trend_v1: lookback_days, hold_days)
         
     Returns:
         Dictionary with execution results:
@@ -190,7 +195,18 @@ def execute_signals_from_raw_returns(
         - orders_executed: List of executed orders
         - errors: List of errors
     """
-    emitter = emitter or SimpleSignalEmitter()
+    # Select emitter based on strategy_type if not provided
+    if emitter is None:
+        if strategy_type == "timeboxed_trend_v1":
+            params = strategy_params or {}
+            emitter = TimeboxedTrendEmitter(
+                lookback_days=params.get("lookback_days", 20),
+                hold_days=params.get("hold_days", 10),
+                default_quantity=params.get("default_quantity", 100.0)
+            )
+        else:
+            # Default to SimpleSignalEmitter for buy_hold or unknown types
+            emitter = SimpleSignalEmitter()
     adapter = SimpleSignalAdapter(config=adapter_config)
     consumer = SimpleSignalConsumer()
     
