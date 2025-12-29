@@ -14,3 +14,4 @@ artifacts/**/runs/
 !configs/*.json
 
 .venv/
+.env
