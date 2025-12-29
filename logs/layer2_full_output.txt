@@ -1,0 +1,56 @@
+================================================================================
+Layer 2: Statistical Backtest - CL
+================================================================================
+Instrument: CL
+Strategy: buy_hold (daily_trend=0.001)
+Date Range: 2023-01-01 to 2023-12-31
+Initial Capital: $50,000.00
+
+Running 1 cycles...
+
+[Layer2] CL cycle 1/1 (100.0%)
+RUN_CYCLE cycle_id=layer2_cl_cycle_001 hold=False bootstrap=True
+  No state loaded (first cycle)
+  should_use_hold_quantity_mode=False
+  is_first_cycle=True (current_state=True, allocations_len=0)
+  validation_bootstrap_first_cycle=True
+  use_normal_cycle=True
+  use_normal_cycle=True, ruleset=True
+
+================================================================================
+Backtest Complete for CL
+================================================================================
+
+CL Results:
+  Trade Count: 0
+  Expectancy Per Trade: $0.00
+  Win Rate: 0.00%
+  Profit Factor: 0.00
+  Net PnL: $0.00
+  Total Return: 0.00%
+  CAGR: 0.00%
+  Max Drawdown: $0.00 (0.00%)
+  Drawdown vs Funded Limit: 0.0% (limit: 5.0%)
+  Daily Loss Hit Frequency: 0.00% (0 breaches)
+  Days Survived: 1/1
+  Survival Rate: 100.0%
+
+================================================================================
+LAYER 2 RESULTS SUMMARY
+================================================================================
+
+ES: ERROR
+
+NQ: ERROR
+
+CL:
+  Trade Count: 0
+  Expectancy: $0.00
+  Profit Factor: 0.00
+  Total Return: 0.00%
+  CAGR: 0.00%
+  Max Drawdown: 0.00% (vs limit: 0.0%)
+  Daily Loss Breaches: 0 (0.00%)
+  Days Survived: 1/1 (100.0%)
+
+Results saved to: LAYER2_BACKTEST_RESULTS.json
