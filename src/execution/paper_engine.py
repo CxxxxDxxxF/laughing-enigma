@@ -165,7 +165,7 @@ class PaperExecutionEngine(ExecutionEngine):
         if self.risk_limits.max_daily_loss is not None:
             # For this simple implementation, we check realized PnL
             # A more sophisticated implementation would track unrealized PnL too
-            if current_position.realized_pnl < self.risk_limits.max_daily_loss:
+            if current_position.realized_pnl <= self.risk_limits.max_daily_loss:
                 raise RiskLimitExceededError(
                     f"Daily loss {current_position.realized_pnl} would exceed max {self.risk_limits.max_daily_loss}"
                 )

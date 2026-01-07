@@ -12,14 +12,27 @@ Assumptions:
 
 import hashlib
 import json
+import numpy as np
+from functools import lru_cache
+@lru_cache(maxsize=128)
+def _hash_to_seed(inputs_hash: str) -> int:
+    """Convert a deterministic hash string to an integer seed.
+    Uses the first 16 hex characters of the hash.
+    Cached for performance when the same inputs are used repeatedly.
+    """
+    return int(inputs_hash[:16], 16)
+
 from typing import Dict, Any, List, Tuple, Optional
+# Removed duplicate import; lru_cache already imported above
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from .base import BaseResearchEngine, BacktestResult, BacktestError
 from ..core.experiment import Experiment
 from ..core.metrics import Metrics
+from ..core.metrics import Metrics
 from ..core.artifacts import ArtifactStore
+from ..strategy.factory import StrategyFactory
+from ..execution.signal import SignalType
 
 
 class SimpleResearchEngineError(BacktestError):
@@ -169,9 +182,10 @@ class SimpleResearchEngine(BaseResearchEngine):
         
         # Validate strategy_type
         strategy_type = inputs["strategy_type"]
-        if strategy_type != "buy_hold":
-            raise SimpleResearchEngineError(
-                f"strategy_type must be 'buy_hold', got: {strategy_type}"
+        if strategy_type != "buy_hold" and strategy_type not in StrategyFactory._registry:
+             raise SimpleResearchEngineError(
+                f"strategy_type must be 'buy_hold' or a registered strategy, got: {strategy_type}. "
+                f"Available: {['buy_hold'] + list(StrategyFactory._registry.keys())}"
             )
         
         return True
@@ -243,6 +257,7 @@ class SimpleResearchEngine(BaseResearchEngine):
             initial_capital=initial_capital,
             instrument=instrument,
             inputs_hash=self.compute_inputs_hash(inputs),
+            inputs=inputs, # Pass full inputs
             experiment_config=experiment.config
         )
         
@@ -267,6 +282,7 @@ class SimpleResearchEngine(BaseResearchEngine):
         initial_capital: float,
         instrument: str,
         inputs_hash: str,
+        inputs: Dict[str, Any], # Add inputs arg
         experiment_config: Dict[str, Any]
     ) -> RawReturns:
         """Generate deterministic return series.
@@ -304,42 +320,108 @@ class SimpleResearchEngine(BaseResearchEngine):
         
         num_days = len(dates)
         
+        # Generate list of dates (inclusive)
+        dates = []
+        current_date = start_date
+        while current_date <= end_date:
+            dates.append(current_date.strftime("%Y-%m-%d"))
+            current_date += timedelta(days=1)
+
+        num_days = len(dates)
+
+        
+        # 2. Simulate Strategy Execution
+        # ---------------------------------------------------------------------
+        strategy_type = inputs.get("strategy_type", "buy_hold")
+        
+        # Determine strategy instance
+        strategy = None
+        if strategy_type != "buy_hold":
+            # Assume we can create it with default config or config from inputs
+            # For this simple engine, we pass the inputs as config
+            try:
+                # Add instrument to config
+                config = inputs.copy()
+                strategy = StrategyFactory.create(strategy_type, config)
+            except Exception as e:
+                # If creation fails, we might fall back or error. 
+                # Ideally validation caught this, but factory might have runtime reqs.
+                pass 
+
+        final_returns = []
+        portfolio_value = initial_capital
+        
+        # Price reconstruction for strategy
+        # Market Price starts at 100.0 (arbitrary)
+        market_price = 100.0
+        price_history = [market_price] 
+        
+        # Current Position (0.0 to 1.0)
+        # BuyHold = 1.0 always
+        # Strategies start at 0.0 (Cash) or 1.0? 
+        # Let's assume start with 0.0 and wait for signal.
+        current_position = 1.0 if strategy_type == "buy_hold" else 0.0
+        
         # Generate deterministic daily returns
         # Use hash as seed to ensure determinism
-        # Convert first 16 chars of hash to integer seed
         seed = int(inputs_hash[:16], 16)
-        
-        # Generate returns using deterministic function
-        # This is a simplified approach: use a deterministic pattern
-        # based on the seed to generate bounded returns
-        returns = []
-        value = initial_capital
-        
+
         for i in range(num_days):
+            # 1. Get Market Return for Today
             # Deterministic pseudo-random value from seed and day index
-            # Using simple linear congruential generator-like approach
-            # This is NOT cryptographically secure, just deterministic
             pseudo_random = ((seed + i * 7919) % 10000) / 10000.0
+            market_daily_return = 0.0001 * (2 * pseudo_random - 1)  # -0.01% to +0.01%
             
-            # Map to bounded daily return (-0.01% to +0.01% range)
-            # Small daily volatility for realistic backtest
-            daily_return = 0.0001 * (2 * pseudo_random - 1)  # -0.01% to +0.01%
+            # Add trend
+            trend = experiment_config.get("daily_trend", 0.0001)
+            market_daily_return += trend
             
-            # Add small trend based on experiment config if present
-            # Default to slight positive drift
-            trend = experiment_config.get("daily_trend", 0.0001)  # 0.01% per day default
-            daily_return += trend
+            # 2. Update Market Price
+            market_price *= (1 + market_daily_return)
             
-            returns.append(daily_return)
-            value *= (1 + daily_return)
-        
-        final_value = value
-        
+            # 3. Strategy Decision (if applicable)
+            if strategy:
+                # Feed history including TODAY's price (Close) or Yesterday's?
+                # In backtesting, typically we run signal on CLOSE of T, execute on OPEN of T+1?
+                # Or Signal on Close T-1, Execute Close T?
+                # For simplicity in this engine: 
+                #   We use history up to T-1 to generate signal for T?
+                #   Or we use history up to T (today) to determine allocation for T? (Requires lookahead if using Close)
+                #   Standard: Calculate signal using Prices[...T-1]. Execute at Price[T] (assuming Market on Open).
+                #   Let's do: Signal based on History[...T-1]. (If i==0, history is empty/just init).
+                
+                # Mock data provider dict for strategy
+                # Strategy expects {instrument: [prices]}
+                data_snapshot = {instrument: price_history.copy()}
+                
+                signal = strategy.generate_signals(data_snapshot)
+                
+                if signal:
+                    # print(f"DEBUG: Day {i} Signal: {signal.signal_type} Momentum: {signal.metadata.get('momentum')}")
+                    if signal.signal_type == SignalType.BUY:
+                        current_position = 1.0
+                    elif signal.signal_type == SignalType.SELL:
+                        current_position = 0.0
+                # else:
+                #    print(f"DEBUG: Day {i} No Signal. Hist len: {len(price_history)}")
+                        
+            # 4. Calculate Portfolio Return considering Position
+            # Portfolio Return = MarketReturn * Position
+            portfolio_daily_return = market_daily_return * current_position
+            # if current_position > 0:
+            #    print(f"DEBUG: Day {i} Return: {portfolio_daily_return:.6f} Pos: {current_position}")
+            
+            final_returns.append(portfolio_daily_return)
+            portfolio_value *= (1 + portfolio_daily_return)
+            
+            # Append today's price to history for NEXT day's decision
+            price_history.append(market_price)
+
         return RawReturns(
             dates=dates,
-            returns=returns,
+            returns=final_returns,
             initial_capital=initial_capital,
-            final_value=final_value
+            final_value=portfolio_value
         )
     
     def _persist_artifacts(

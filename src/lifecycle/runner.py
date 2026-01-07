@@ -46,6 +46,7 @@ from ..rebalance.executor import (
 )
 from ..engines.simple import SimpleResearchEngine
 from ..core.artifacts import ArtifactStore, LocalArtifactStore
+from ..core.config import ExecutionMode
 from ..execution import PaperExecutionEngine, SignalType
 from .state_store import PortfolioStateStore, LocalPortfolioStateStore
 from .cadence import CycleCadenceConfig, check_cadence
@@ -55,16 +56,7 @@ from ..market.interface import MarketDataProvider
 from .evidence import generate_evidence_bundle, persist_evidence_bundle
 
 
-class ExecutionMode(str, Enum):
-    """Execution mode for portfolio cycles.
-    
-    SIMULATION: Allows relaxed constraints for testing/backtesting
-    LIVE_DRY: Enforces strict LIVE constraints but does not place real orders (for testing/validation)
-    LIVE: Enforces strict constraints for production trading with real orders
-    """
-    SIMULATION = "simulation"
-    LIVE_DRY = "live_dry"
-    LIVE = "live"
+
 
 
 class CycleError(Exception):
@@ -1106,8 +1098,8 @@ def run_portfolio_cycle(
             current_state = CurrentPortfolioState(
                 strategy_allocations={},
                 total_capital=config.allocation_config.total_capital,
-                timestamp=cycle_timestamp,
                 cash_balance=config.allocation_config.total_capital,
+                timestamp=cycle_timestamp,
                 positions_by_instrument=None
             )
             if state_store:

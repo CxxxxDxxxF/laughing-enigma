@@ -28,6 +28,12 @@ class OrderType(Enum):
     STOP_LIMIT = "stop_limit"  # Stop order with limit price
 
 
+class OrderSide(Enum):
+    """Side of the order."""
+    BUY = "buy"
+    SELL = "sell"
+
+
 @dataclass(frozen=True)
 class Order:
     """Immutable order record.

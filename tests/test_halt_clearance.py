@@ -96,6 +96,7 @@ def test_state_continuity():
     state = CurrentPortfolioState(
         strategy_allocations={},
         total_capital=9000.0,
+        cash_balance=9000.0,  # Explicitly set cash balance
         timestamp=datetime.now(),
         drawdown_tracker=DrawdownTracker(10000.0, date.today()),
         positions_by_instrument={},

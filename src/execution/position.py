@@ -41,8 +41,8 @@ class Position:
         if self.updated_at is None:
             object.__setattr__(self, 'updated_at', datetime.now())
         
-        if self.cost_basis <= 0:
-            raise ValueError(f"Cost basis must be positive, got: {self.cost_basis}")
+        if self.quantity != 0 and self.cost_basis <= 0:
+            raise ValueError(f"Cost basis must be positive for non-flat positions, got: {self.cost_basis}")
     
     def is_long(self) -> bool:
         """Check if position is long.

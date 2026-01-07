@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from enum import Enum
 
 # Try to load dotenv, but don't fail if not installed
 try:
@@ -42,6 +43,18 @@ def load_env(env_path: Optional[Path] = None) -> None:
         
         # Fallback to default behavior
         load_dotenv()
+
+
+class ExecutionMode(str, Enum):
+    """Execution mode for portfolio cycles.
+    
+    SIMULATION: Allows relaxed constraints for testing/backtesting
+    LIVE_DRY: Enforces strict LIVE constraints but does not place real orders (for testing/validation)
+    LIVE: Enforces strict constraints for production trading with real orders
+    """
+    SIMULATION = "simulation"
+    LIVE_DRY = "live_dry"
+    LIVE = "live"
 
 
 @dataclass(frozen=True)

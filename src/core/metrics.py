@@ -5,6 +5,7 @@ All metrics must be explainable line-by-line.
 """
 
 import math
+import numpy as np
 from typing import Dict, Any, Optional, List, TYPE_CHECKING
 from dataclasses import dataclass
 from datetime import datetime
@@ -391,25 +392,15 @@ def _compute_volatility(returns: List[float]) -> float:
         MetricsError: If insufficient data (less than 2 returns)
     """
     n = len(returns)
-    
     if n < 2:
         raise MetricsError(
             f"Cannot compute volatility with fewer than 2 returns, got {n}. "
             f"Variance requires at least 2 data points."
         )
-    
-    # Compute mean
-    mean = sum(returns) / n
-    
-    # Compute sample variance (n-1 denominator for sample standard deviation)
-    variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
-    
-    # Standard deviation
-    std_dev = math.sqrt(variance)
-    
-    # Annualize (252 trading days per year)
-    annualized_volatility = std_dev * math.sqrt(252)
-    
+    # Use NumPy for variance and std deviation
+    returns_arr = np.array(returns, dtype=np.float64)
+    std_dev = returns_arr.std(ddof=1)  # sample std dev
+    annualized_volatility = std_dev * np.sqrt(252)
     return annualized_volatility
 
 
@@ -439,37 +430,21 @@ def _compute_sharpe_ratio(returns: List[float], risk_free_rate: float = 0.0) -> 
         MetricsError: If volatility is zero (Sharpe undefined) or insufficient data
     """
     n = len(returns)
-    
     if n < 2:
         raise MetricsError(
             f"Cannot compute Sharpe ratio with fewer than 2 returns, got {n}. "
             f"Both mean and variance require at least 2 data points."
         )
-    
-    # Compute mean daily return
-    mean_daily = sum(returns) / n
-    
-    # Compute sample variance
-    variance = sum((r - mean_daily) ** 2 for r in returns) / (n - 1)
-    std_dev_daily = math.sqrt(variance)
-    
-    # If volatility is zero, Sharpe is undefined
+    returns_arr = np.array(returns, dtype=np.float64)
+    mean_daily = returns_arr.mean()
+    std_dev_daily = returns_arr.std(ddof=1)
     if std_dev_daily == 0.0:
         raise MetricsError(
             "Sharpe ratio is undefined when volatility is zero. "
             "All returns are identical, so there is no risk to adjust for."
         )
-    
-    # Annualize mean return (simple multiplication, not compounding)
     annualized_mean = mean_daily * 252
-    
-    # Annualize volatility
-    annualized_volatility = std_dev_daily * math.sqrt(252)
-    
-    # Compute excess return (annualized)
+    annualized_volatility = std_dev_daily * np.sqrt(252)
     excess_return = annualized_mean - risk_free_rate
-    
-    # Sharpe ratio
     sharpe = excess_return / annualized_volatility
-    
     return sharpe

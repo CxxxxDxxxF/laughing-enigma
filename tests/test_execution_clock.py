@@ -53,7 +53,7 @@ class TestExecutionClock(TestCase):
         
         # Create identical signals
         signal = Signal(
-            signal_id="test_signal",
+            strategy_id="test_signal",
             instrument="AAPL",
             signal_type=SignalType.BUY,
             quantity=100.0,

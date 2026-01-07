@@ -46,21 +46,26 @@ class TestDailyLossEnforcement(TestCase):
         )
         
         # At threshold exactly (-$1,000)
+        # Use 18:00 (6 PM) to ensure we are in the Jan 1 session (since it starts at 17:00)
+        # 10:00 would be Dec 31 session, causing a tracker reset
         equity_at_limit = initial_balance - 1000.0  # $49,000
         snapshot = tracker.update(
             equity=equity_at_limit,
             realized_pnl=-500.0,
             unrealized_pnl=-500.0,
-            timestamp=datetime(2024, 1, 1, 10, 0, 0, tzinfo=ct_tz),
+            timestamp=datetime(2024, 1, 1, 18, 0, 0, tzinfo=ct_tz),
             day_boundary=boundary
         )
-        
-        daily_loss = snapshot.equity - snapshot.initial_balance  # Should be -$1,000
         
         # Check violation using ruleset validation
         from src.rebalance.executor import RebalanceExecutionResult
         from src.rebalance.planner import CurrentPortfolioState
         
+        class MockExecutionEngine:
+            @property
+            def positions(self):
+                return {}
+
         # Create dummy execution result and state for validation
         dummy_execution = RebalanceExecutionResult(
             execution_id="test",
@@ -84,7 +89,7 @@ class TestDailyLossEnforcement(TestCase):
         violations = ruleset.validate_execution(
             dummy_execution,
             current_state,
-            execution_engine=None,
+            execution_engine=MockExecutionEngine(),
             current_prices=None,
             day_boundary=boundary,
             skip_equity_recalculation=True

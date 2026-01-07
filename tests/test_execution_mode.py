@@ -218,7 +218,8 @@ class TestExecutionMode(TestCase):
                 state_store=self.state_store,
                 execution_mode=ExecutionMode.LIVE,
                 cycle_timestamp=datetime.now(),
-                cycle_id="test_cycle_resume"
+                cycle_id="test_cycle_resume",
+                market_data_provider=self.mock_provider
             )
         
         # Updated assertion for new error message

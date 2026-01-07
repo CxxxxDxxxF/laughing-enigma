@@ -75,12 +75,26 @@ class TestSessionBoundary(TestCase):
         # Just before midnight
         ts_before = datetime(2024, 1, 1, 23, 59, 59, tzinfo=utc_tz)
         trading_date = boundary.get_trading_date(ts_before)
-        self.assertEqual(trading_date, date(2023, 12, 31))
+        # 23:59:59 >= 00:00:00 (Session Start), so it belongs to Jan 1 session
+        self.assertEqual(trading_date, date(2024, 1, 1))
         
         # Exactly at midnight
         ts_at_start = datetime(2024, 1, 2, 0, 0, 0, tzinfo=utc_tz)
         trading_date = boundary.get_trading_date(ts_at_start)
         self.assertEqual(trading_date, date(2024, 1, 2))
+    
+    def test_midnight_session_end_boundary(self):
+         """Test boundary conditions near midnight session end."""
+         utc_tz = timezone.utc
+         boundary = TradingDayBoundary(
+             timezone=utc_tz,
+             session_start_time=time(0, 0, 0)
+         )
+         # 1 second before midnight (end of Jan 1 session)
+         ts_before = datetime(2024, 1, 1, 23, 59, 59, tzinfo=utc_tz)
+         trading_date = boundary.get_trading_date(ts_before)
+         # Should be Jan 1 because session is Jan 1 00:00 to Jan 1 23:59
+         self.assertEqual(trading_date, date(2024, 1, 1))
     
     def test_has_day_rollover_session_boundary(self):
         """Test that has_day_rollover correctly detects session boundaries."""
@@ -115,8 +129,14 @@ class TestSessionBoundary(TestCase):
                         "Should rollover at next day's session start")
         
         # No rollover across midnight if both before session start
-        ts9 = datetime(2024, 1, 1, 16, 0, 0, tzinfo=ct_tz)
-        ts10 = datetime(2024, 1, 2, 16, 0, 0, tzinfo=ct_tz)
+        # To test this meaningfully, we need two timestamps that cross midnight 
+        # but are still in the same session (i.e. between Session Start and Next Session Start)
+        # Session starts at 17:00 (5 PM).
+        # Session 1: Jan 1 17:00 to Jan 2 17:00.
+        # Midnight is Jan 2 00:00.
+        # Pick Jan 1 20:00 (8 PM) and Jan 2 04:00 (4 AM). Both are in Session 1.
+        ts9 = datetime(2024, 1, 1, 20, 0, 0, tzinfo=ct_tz)
+        ts10 = datetime(2024, 1, 2, 4, 0, 0, tzinfo=ct_tz)
         self.assertFalse(boundary.has_day_rollover(ts9, ts10),
                          "Should NOT rollover at midnight if session starts at 5 PM")
     
