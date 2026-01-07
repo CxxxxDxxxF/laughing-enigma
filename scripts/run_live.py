@@ -109,16 +109,20 @@ class ProductionRunner:
                 
                 def submit_order(self, signal):
                     # Mock submission (don't call Alpaca)
-                    from src.execution.order import Order, OrderStatus
+                    from src.execution.order import Order, OrderStatus, OrderType
                     import uuid
+                    # Convert SignalType to side string
+                    side = "buy" if signal.signal_type.value == "buy" else "sell"
                     return Order(
-                        order_id=str(uuid.uuid4()),
+                        id=str(uuid.uuid4()),
+                        signal_id=None,
                         instrument=signal.instrument,
                         quantity=signal.quantity,
-                        side=signal.side,
-                        order_type="market",
+                        side=side,
+                        order_type=OrderType.MARKET,
                         status=OrderStatus.ACCEPTED,
-                        created_at=datetime.now()
+                        created_at=datetime.now(),
+                        accepted_at=datetime.now()
                     )
 
                 def check_execution_status(self, order):
@@ -127,38 +131,30 @@ class ProductionRunner:
                         return []
                     
                     fill = Fill(
-                        fill_id=f"fill_{order.order_id}",
-                        order_id=order.order_id,
+                        id=f"fill_{order.id}",
+                        order_id=order.id,
                         instrument=order.instrument,
+                        side=order.side,
                         quantity=order.quantity,
-                        price=100.0, # Dummy price
-                        timestamp=datetime.now(),
+                        price=100.0,  # Dummy price
+                        filled_at=datetime.now(),
                         fee=0.0
                     )
-                    order.status = OrderStatus.FILLED
-                    order.fills.append(fill)
                     return [fill]
 
                 def execute_order(self, order, price, timestamp=None):
-                     # Mock immediate execution for execute_rebalance_plan compatibility
-                    if order.status == OrderStatus.FILLED:
-                        return order.fills
-                    
+                    # Mock immediate execution for execute_rebalance_plan compatibility
+                    # Note: Order is frozen, so we cannot mutate it
                     fill = Fill(
-                        fill_id=f"fill_{order.order_id}",
-                        order_id=order.order_id,
+                        id=f"fill_{order.id}",
+                        order_id=order.id,
                         instrument=order.instrument,
+                        side=order.side,
                         quantity=order.quantity,
                         price=price or 100.0,
-                        timestamp=timestamp or datetime.now(),
+                        filled_at=timestamp or datetime.now(),
                         fee=0.0
                     )
-                    order.status = OrderStatus.FILLED
-                    order.fills.append(fill)
-                    return [fill]
-
-                    order.status = OrderStatus.FILLED
-                    order.fills.append(fill)
                     return [fill]
 
             # Mock Market Data Provider

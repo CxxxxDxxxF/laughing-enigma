@@ -158,13 +158,19 @@ class LocalPortfolioStateStore(PortfolioStateStore):
             # Load positions if present
             positions_by_instrument = data.get("positions_by_instrument")
             
+            # Default cash_balance to total_capital if not in stored data (backward compatibility)
+            # This ensures old state files without cash_balance don't cause $0.00 balance errors
+            cash_balance = data.get("cash_balance")
+            if cash_balance is None:
+                cash_balance = data["total_capital"]
+            
             return CurrentPortfolioState(
                 strategy_allocations=data["strategy_allocations"],
                 total_capital=data["total_capital"],
                 timestamp=datetime.fromisoformat(data["timestamp"]),
                 drawdown_tracker=drawdown_tracker,
                 positions_by_instrument=positions_by_instrument,
-                cash_balance=data.get("cash_balance"),
+                cash_balance=cash_balance,
                 metadata=data.get("metadata")
             )
             
