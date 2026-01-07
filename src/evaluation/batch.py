@@ -25,6 +25,7 @@ from .evaluator import (
     EvaluationResult,
     StrategyEvaluation,
     EvaluationError,
+    EvaluationMetrics,
 )
 from ..engines.simple import SimpleResearchEngine
 from ..core.experiment import Experiment

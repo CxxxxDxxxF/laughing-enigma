@@ -18,6 +18,7 @@ from enum import Enum
 from ..allocation import AllocationResult, PortfolioAllocation
 from ..core.artifacts import ArtifactStore
 from typing import TYPE_CHECKING
+# Removed import of CycleError to avoid circular dependency
 
 if TYPE_CHECKING:
     from ..lifecycle.runner import ExecutionMode
@@ -44,6 +45,7 @@ class CurrentPortfolioState:
     Attributes:
         strategy_allocations: Dictionary mapping strategy_id -> current capital
         total_capital: Total capital in portfolio
+        cash_balance: Current cash balance in the portfolio
         timestamp: Timestamp of this state snapshot
         drawdown_tracker: Optional drawdown tracker for Topstep-style rules
         positions_by_instrument: Dictionary mapping instrument -> Position dict (from Position.to_dict())
@@ -57,8 +59,11 @@ class CurrentPortfolioState:
     strategy_allocations: Dict[str, float]
     total_capital: float
     timestamp: datetime
+    cash_balance: float = 0.0
     drawdown_tracker: Optional['DrawdownTracker'] = None
     positions_by_instrument: Optional[Dict[str, Dict[str, Any]]] = None
+    
+    metadata: Optional[Dict[str, Any]] = None
     
     def get_allocation(self, strategy_id: str) -> float:
         """Get current allocation for a strategy.
@@ -76,12 +81,15 @@ class CurrentPortfolioState:
         result = {
             "strategy_allocations": self.strategy_allocations,
             "total_capital": self.total_capital,
+            "cash_balance": self.cash_balance,
             "timestamp": self.timestamp.isoformat(),
         }
         if self.drawdown_tracker is not None:
             result["drawdown_tracker"] = self.drawdown_tracker.to_dict()
         if self.positions_by_instrument is not None:
             result["positions_by_instrument"] = self.positions_by_instrument
+        if self.metadata is not None:
+            result["metadata"] = self.metadata
         return result
 
 
@@ -234,6 +242,8 @@ def _compute_deltas(
         deltas[alloc.strategy_id] = target - current
     
     # Check for strategies in current state but not in target (should be sold)
+    # Task 3.3: Dict iteration order matters here for deterministic trade intent generation.
+    # Python 3.7+ guarantees insertion-order preservation for dicts.
     for strategy_id, current in current_state.strategy_allocations.items():
         if strategy_id not in deltas:
             # Strategy not in target allocation - full sell
@@ -394,7 +404,8 @@ def _generate_trade_intents(
 def _compute_rebalance_metrics(
     trade_intents: List[TradeIntent],
     total_capital: float,
-    original_deltas: Dict[str, float]
+    original_deltas: Dict[str, float],
+    current_state: CurrentPortfolioState
 ) -> Dict[str, Any]:
     """Compute rebalance metrics.
     
@@ -402,6 +413,7 @@ def _compute_rebalance_metrics(
         trade_intents: List of trade intents
         total_capital: Total capital
         original_deltas: Original deltas (before constraints)
+        current_state: Current portfolio state (for cash balance check)
         
     Returns:
         Dictionary of metrics
@@ -425,6 +437,11 @@ def _compute_rebalance_metrics(
     # Compute buy/sell amounts
     buy_amount = sum(ti.amount for ti in trades if ti.direction == TradeDirection.BUY)
     sell_amount = sum(ti.amount for ti in trades if ti.direction == TradeDirection.SELL)
+
+    # Check for sufficient cash balance for buys
+    total_buy = sum(ti.amount for ti in trade_intents if ti.direction == TradeDirection.BUY)
+    if total_buy > current_state.cash_balance:
+        raise RebalanceError(f"Rebalance requires ${total_buy:.2f} cash but only ${current_state.cash_balance:.2f} available.")
     
     return {
         "num_trades": num_trades,
@@ -531,7 +548,7 @@ def plan_rebalance(
         trade_intents = _generate_trade_intents(deltas, allocation_result, current_state)
         
         # Step 6: Compute metrics
-        metrics = _compute_rebalance_metrics(trade_intents, current_state.total_capital, original_deltas)
+        metrics = _compute_rebalance_metrics(trade_intents, current_state.total_capital, original_deltas, current_state)
         
         # plan_timestamp already set above
         return RebalancePlan(

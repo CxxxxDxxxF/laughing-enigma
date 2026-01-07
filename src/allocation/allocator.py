@@ -389,8 +389,9 @@ def allocate_capital(
     """
     # Validate LIVE/LIVE_DRY mode requirements
     if execution_mode is not None:
-        # Check for LIVE or LIVE_DRY mode (string comparison to avoid circular import)
-        if str(execution_mode) in ("live", "live_dry"):
+        # Check for LIVE or LIVE_DRY mode (handle Enum string representation)
+        mode_val = getattr(execution_mode, "value", str(execution_mode))
+        if mode_val in ("live", "live_dry"):
             if allocation_id is None:
                 raise AllocationError("LIVE mode requires explicit allocation_id")
             if allocation_timestamp is None:

@@ -55,7 +55,8 @@ class PaperExecutionEngine(ExecutionEngine):
         artifact_store: Optional['ArtifactStore'] = None,
         session_id: Optional[str] = None,
         clock: Optional[ExecutionClock] = None,
-        id_provider: Optional[IDProvider] = None
+        id_provider: Optional[IDProvider] = None,
+        slippage_factor: float = 0.0
     ):
         """Initialize paper execution engine.
         
@@ -82,6 +83,7 @@ class PaperExecutionEngine(ExecutionEngine):
         self.instrument = instrument
         self.risk_limits = risk_limits or RiskLimits()
         self.fixed_fee = fixed_fee
+        self.slippage_factor = slippage_factor  # Task 2.3: Slippage modeling
         self.artifact_store = artifact_store
         self.id_provider = id_provider or SimulationIDProvider()
         self.clock = clock or SimulationClock()  # Default to simulation clock
@@ -339,7 +341,17 @@ class PaperExecutionEngine(ExecutionEngine):
             self.orders[order.id] = rejected_order
             raise OrderRejectionError(f"Order rejected due to risk limits: {e}") from e
         
-        # Create fill (full fill, immediate)
+        # Create fill (full fill, immediate) with slippage applied (Task 2.3)
+        # Slippage is a percentage increase for BUY, decrease for SELL
+        slippage_adjustment = 1.0
+        if self.slippage_factor > 0:
+            if order.side == "buy":
+                slippage_adjustment = 1.0 + self.slippage_factor
+            else:  # sell
+                slippage_adjustment = 1.0 - self.slippage_factor
+        
+        fill_price = current_price * slippage_adjustment
+        
         fill_id = self.id_provider.new_fill_id(order_id=order.id)
         fill = Fill(
             id=fill_id,
@@ -347,7 +359,7 @@ class PaperExecutionEngine(ExecutionEngine):
             instrument=order.instrument,
             side=order.side,
             quantity=order.quantity,
-            price=current_price,
+            price=fill_price,
             fee=self.fixed_fee,
             filled_at=timestamp
         )

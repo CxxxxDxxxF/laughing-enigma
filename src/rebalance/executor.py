@@ -245,7 +245,9 @@ def execute_rebalance_plan(
     mapper: Optional[RebalanceSignalMapper] = None,
     execution_id: Optional[str] = None,
     execution_timestamp: Optional[datetime] = None,
-    execution_mode: Optional['ExecutionMode'] = None
+    execution_mode: Optional['ExecutionMode'] = None,
+    allow_partial_rebalance: bool = True,
+    max_retries: int = 0
 ) -> RebalanceExecutionResult:
     """Execute a rebalance plan through paper execution engine.
     
@@ -391,19 +393,28 @@ def execute_rebalance_plan(
             intent_results.append(result)
             continue
         
-        # Execute order
+        # Execute order with retry logic (Task 2.2)
         fills = []
-        try:
-            fills = execution_engine.execute_order(order, price, timestamp=plan.plan_timestamp)
-        except Exception as e:
-            # Order execution failed
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                fills = execution_engine.execute_order(order, price, timestamp=plan.plan_timestamp)
+                last_error = None
+                break  # Success
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    continue  # Retry
+        
+        if last_error is not None:
+            # Order execution failed after all retries
             result = IntentExecutionResult(
                 intent_id=intent.strategy_id,
                 intent=intent,
                 signal=signal,
                 order=order,
                 success=False,
-                error=f"Order execution failed: {e}"
+                error=f"Order execution failed after {max_retries + 1} attempts: {last_error}"
             )
             intent_results.append(result)
             continue
@@ -452,6 +463,13 @@ def execute_rebalance_plan(
             "order_execution": sum(1 for r in failed if "Order execution" in (r.error or "")),
         }
     }
+    
+    # Task 2.1: Validate full rebalance success if allow_partial_rebalance is False
+    if not allow_partial_rebalance and failed_intents > 0:
+        raise RebalanceExecutionError(
+            f"Partial rebalance failed: {failed_intents} of {total_intents} intents failed. "
+            f"Set allow_partial_rebalance=True to allow partial execution."
+        )
     
     return RebalanceExecutionResult(
         execution_id=execution_id,

@@ -163,7 +163,9 @@ class LocalPortfolioStateStore(PortfolioStateStore):
                 total_capital=data["total_capital"],
                 timestamp=datetime.fromisoformat(data["timestamp"]),
                 drawdown_tracker=drawdown_tracker,
-                positions_by_instrument=positions_by_instrument
+                positions_by_instrument=positions_by_instrument,
+                cash_balance=data.get("cash_balance"),
+                metadata=data.get("metadata")
             )
             
         except Exception as e:
@@ -220,6 +222,17 @@ class LocalPortfolioStateStore(PortfolioStateStore):
         except Exception as e:
             raise PortfolioStateStoreError(f"Failed to save state for portfolio {portfolio_id}: {e}") from e
     
+    def _is_checkpoint_state(self, state_id: str) -> bool:
+        """Check if a state ID represents a valid loadable checkpoint.
+        
+        Contract:
+        - Must end with '_after' (standard completed cycle)
+        - OR match a known halted state pattern (if we migrate to metadata-based checking later)
+        
+        Currently enforces '_after' suffix as the single source of truth for "final state of a cycle".
+        """
+        return state_id.endswith('_after')
+
     def list_states(self, portfolio_id: str) -> List[str]:
         """List all state IDs for a portfolio (sorted, most recent first).
         
@@ -242,18 +255,23 @@ class LocalPortfolioStateStore(PortfolioStateStore):
             # Extract state IDs and sort by filename (which contains timestamp)
             state_ids = [f.stem for f in state_files]
             
-            # Filter to only _after states (most recent completed state)
-            # _before states are snapshots, _after states are the final state after cycle completion
-            after_state_ids = [sid for sid in state_ids if sid.endswith('_after')]
+            # Filter to only checkpoint states (most recent completed/halted state)
+            # This prevents loading intermediate _before snapshots or incorrectly named files
+            checkpoint_state_ids = [sid for sid in state_ids if self._is_checkpoint_state(sid)]
             
-            if after_state_ids:
+            if checkpoint_state_ids:
                 # Sort by filename (most recent first - assuming timestamp-based IDs)
-                after_state_ids.sort(reverse=True)
-                return after_state_ids
+                checkpoint_state_ids.sort(reverse=True)
+                return checkpoint_state_ids
             else:
-                # Fallback: if no _after states, use all states sorted by timestamp
-                state_ids.sort(reverse=True)
-                return state_ids
+                # Fallback: if no checkpoint states found, return nothing (safer not to load partials)
+                # But for backward compatibility or debugging, maybe return all?
+                # User Requirement: "load_latest_state must never ignore halted states."
+                # If we return partials, we risk rolling back. Better to return empty if no valid checkpoints.
+                # However, original logic had a fallback.
+                # To be "safer", we should strictly require compliance.
+                # If no _after states exist, we assume no valid history.
+                return []
             
         except Exception as e:
             raise PortfolioStateStoreError(f"Failed to list states for portfolio {portfolio_id}: {e}") from e

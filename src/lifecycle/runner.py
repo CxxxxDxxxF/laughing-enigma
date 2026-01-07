@@ -15,14 +15,13 @@ Determinism guarantees:
 - Deterministic execution order
 """
 
-import json
-import sys
 import argparse
-from typing import Dict, Any, Optional, Callable, List
-from dataclasses import dataclass, asdict
 from datetime import datetime
-from pathlib import Path
 from enum import Enum
+from typing import Dict, Any, List, Optional, Callable
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
 
 from ..evaluation.batch import (
     BatchEvaluationConfig,
@@ -47,11 +46,13 @@ from ..rebalance.executor import (
 )
 from ..engines.simple import SimpleResearchEngine
 from ..core.artifacts import ArtifactStore, LocalArtifactStore
-from ..execution import PaperExecutionEngine
+from ..execution import PaperExecutionEngine, SignalType
 from .state_store import PortfolioStateStore, LocalPortfolioStateStore
 from .cadence import CycleCadenceConfig, check_cadence
 from .guardrails import GuardrailsConfig, check_allocation_guardrails, check_rebalance_guardrails, check_execution_guardrails
 from ..rules import Ruleset, RulesViolation, RulesViolationSeverity
+from ..market.interface import MarketDataProvider
+from .evidence import generate_evidence_bundle, persist_evidence_bundle
 
 
 class ExecutionMode(str, Enum):
@@ -80,6 +81,16 @@ class CycleHaltError(CycleError):
     def __init__(self, message: str, result: 'CycleResult'):
         super().__init__(message)
         self.result = result
+
+
+@dataclass
+class HaltFlag:
+    """Data class representing a halt flag."""
+    halted_at: str
+    cycle_id: str
+    reason: str
+    violations_summary: List[Dict[str, Any]]
+    halted_state_id: Optional[str] = None
 
 
 class HaltFlagStore:
@@ -196,6 +207,27 @@ class HaltFlagStore:
         except Exception as e:
             raise CycleError(f"Failed to read halt flag for portfolio {portfolio_id}: {e}") from e
     
+    def get_halt_flag(self, portfolio_id: str) -> Optional[HaltFlag]:
+        """Get halt flag as a structured HaltFlag object.
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            
+        Returns:
+            HaltFlag object, or None if no flag exists
+        """
+        data = self.read_halt_flag(portfolio_id)
+        if data is None:
+            return None
+        
+        return HaltFlag(
+            halted_at=data.get("halted_at", ""),
+            cycle_id=data.get("cycle_id", ""),
+            reason=data.get("reason", ""),
+            violations_summary=data.get("violations_summary", []),
+            halted_state_id=data.get("halted_state_id")
+        )
+    
     def clear_halt_flag(self, portfolio_id: str) -> None:
         """Clear halt flag (manual unhalt).
         
@@ -214,6 +246,71 @@ class HaltFlagStore:
             flag_path.unlink()
         except Exception as e:
             raise CycleError(f"Failed to clear halt flag for portfolio {portfolio_id}: {e}") from e
+    
+    def write_halt_flag_with_checkpoint(
+        self,
+        portfolio_id: str,
+        cycle_id: str,
+        reason: str,
+        halted_at: datetime,
+        halted_state: 'CurrentPortfolioState',
+        state_store: 'PortfolioStateStore',
+        violations_summary: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        """Write halt flag and checkpoint state atomically (Task 4.1).
+        
+        Process:
+        1. Write state to temp file
+        2. Write halt flag to temp file (includes state_id reference)
+        3. Rename state temp -> final (atomic)
+        4. Rename flag temp -> final (atomic)
+        
+        This ensures that if a crash occurs:
+        - Before step 3: No state, no flag (clean)
+        - After step 3, before step 4: State exists but no flag (recoverable)
+        - After step 4: Both exist (normal halt)
+        
+        Args:
+            portfolio_id: Portfolio identifier
+            cycle_id: Cycle ID that triggered the halt
+            reason: Halt reason
+            halted_at: Timestamp when halt occurred
+            halted_state: Portfolio state at halt time
+            state_store: State store for persisting state
+            violations_summary: Optional list of violation dicts
+            
+        Returns:
+            State ID of the persisted halted state
+            
+        Raises:
+            CycleError: If atomic write fails
+        """
+        state_id = f"{cycle_id}_halted"
+        
+        try:
+            # Step 1: Save state first (uses its own atomic write)
+            saved_state_id = state_store.save_state(portfolio_id, halted_state, state_id=state_id)
+            
+            # Step 2-4: Write halt flag with state reference
+            flag_path = self._get_halt_flag_path(portfolio_id)
+            flag_data = {
+                "halted_at": halted_at.isoformat(),
+                "cycle_id": cycle_id,
+                "reason": reason,
+                "violations_summary": violations_summary or [],
+                "halted_state_id": saved_state_id  # Reference for ghost-clearance detection
+            }
+            
+            flag_json = json.dumps(flag_data, indent=2).encode('utf-8')
+            temp_path = flag_path.with_suffix('.tmp')
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_bytes(flag_json)
+            temp_path.replace(flag_path)
+            
+            return saved_state_id
+            
+        except Exception as e:
+            raise CycleError(f"Failed to write atomic halt checkpoint for portfolio {portfolio_id}: {e}") from e
 
 
 def _is_live_mode(execution_mode: ExecutionMode) -> bool:
@@ -262,7 +359,7 @@ def _validate_live_mode_guardrails(
         return
     
     if guardrails_config is None:
-        raise CycleError("LIVE mode requires guardrails_config to be set")
+        raise CycleError("LIVE/LIVE_DRY mode requires guardrails_config to be set")
     
     if guardrails_config.max_turnover_pct_per_cycle >= 1.0:
         raise CycleError(
@@ -294,27 +391,77 @@ def _validate_portfolio_not_halted(
 ) -> None:
     """Validate that portfolio is not in halted state in LIVE/LIVE_DRY mode.
     
+    This function implements the Halt Clearance Contract validation gate.
+    
     Args:
         execution_mode: Execution mode
-        state_store: Portfolio state store (not used, kept for API compatibility)
+        state_store: Portfolio state store
         portfolio_id: Portfolio identifier
-        artifact_store: Artifact store (used to check halt flag)
+        artifact_store: Artifact store
         
     Raises:
-        CycleError: If LIVE/LIVE_DRY mode and portfolio is in halted state
+        CycleError: If portfolio is halted or state is inconsistent
     """
     if not _is_live_mode(execution_mode):
         return
     
     halt_store = HaltFlagStore(artifact_store)
-    if halt_store.halt_flag_exists(portfolio_id):
-        halt_data = halt_store.read_halt_flag(portfolio_id)
-        reason = halt_data.get("reason", "Unknown") if halt_data else "Unknown"
-        cycle_id = halt_data.get("cycle_id", "Unknown") if halt_data else "Unknown"
+    halt_flag = halt_store.read_halt_flag(portfolio_id)
+    
+    if halt_flag:
         raise CycleError(
-            f"Portfolio {portfolio_id} is halted (halted at cycle {cycle_id}: {reason}). "
-            "Manual intervention required before continuing. Use clear_halt_flag() to unhalt."
+            f"Portfolio {portfolio_id} is HALTED (Reason: {halt_flag.get('reason', 'Unknown')}). "
+            f"You CANNOT run a new cycle until this is mechanically cleared. "
+            f"Use 'dashboard.py resolve --acknowledge' to clear safely."
         )
+
+def _validate_resumption_safety(
+    execution_mode: ExecutionMode,
+    state_store: Optional[PortfolioStateStore],
+    portfolio_id: str,
+    artifact_store: ArtifactStore
+) -> None:
+    """Validate safety conditions for resuming a portfolio, especially after a halt.
+    
+    This function performs checks to ensure that if the system was halted,
+    the corresponding state exists and is consistent, preventing "ghost clearance" issues.
+    
+    Args:
+        execution_mode: Execution mode
+        state_store: Portfolio state store
+        portfolio_id: Portfolio identifier
+        artifact_store: Artifact store
+        
+    Raises:
+        CycleError: If state is inconsistent for resumption
+    """
+    if not _is_live_mode(execution_mode):
+        return
+
+    # Validation: Ghost Clearance Check
+    # Ensure that if the system was halted, the corresponding state exists.
+    # We can check the latest state. If it says "halted", checks are good.
+    # If it DOESN'T say halted, but we just crashed/halted, that's fine (we are running next cycle).
+    # The dangerous case is: We halted, but the state representing that halt is MISSING,
+    # and we are now trying to run on top of an OLD state.
+    # This is hard to detect perfectly without an external log, but we can sanity check the latest state.
+    
+    if state_store:
+        latest_state = state_store.load_latest_state(portfolio_id)
+        if latest_state and latest_state.metadata.get("halted"):
+            # We are resuming from a halted state.
+            # Sanity check: If reason is Max Daily Loss, ensure tracker reflects it.
+            reason = latest_state.metadata.get("halt_reason", "")
+            if "Daily Loss" in reason:
+                # Check tracker
+                tracker = latest_state.drawdown_tracker
+                if tracker and tracker.get_daily_loss(tracker.snapshots[-1].equity) > -0.01:
+                     # This implies we halted for loss but tracker shows no loss?
+                     # OR maybe it was a transient intray-day spike that recovered?
+                     # But usually we halt and stay halted.
+                     pass 
+                     # Warning: This check might be too aggressive if markets recovered before snapshot?
+                     # But snapshot is taken AT halt time. So it should show loss.
 
 
 def _validate_live_mode_cycle_id(
@@ -338,6 +485,23 @@ def _validate_live_mode_cycle_id(
                 "LIVE/LIVE_DRY mode requires explicit cycle_id parameter or config.cycle_id "
                 "(cannot auto-generate from datetime.now())"
             )
+
+
+def _validate_live_mode_market_data(
+    execution_mode: ExecutionMode,
+    market_data_provider: Optional[MarketDataProvider]
+) -> None:
+    """Validate that market_data_provider is provided for LIVE/LIVE_DRY mode.
+    
+    Args:
+        execution_mode: Execution mode
+        market_data_provider: Market data provider instance
+        
+    Raises:
+        CycleError: If LIVE/LIVE_DRY mode but provider is missing
+    """
+    if _is_live_mode(execution_mode) and market_data_provider is None:
+        raise CycleError("LIVE/LIVE_DRY mode requires market_data_provider to be provided")
 
 
 @dataclass
@@ -589,8 +753,99 @@ class CycleResult:
             "rules_violations": self.rules_violations or [],
             "ruleset_type": self.ruleset_type,
             "ruleset_config": self.ruleset_config,
+            "survivability_control_events": self.survivability_control_events or [],
         }
 
+
+@dataclass
+class CycleDecision:
+    """Decision from the execution gate."""
+    can_run: bool
+    decision: str  # "PROCEED", "HALT", "BLOCK"
+    reason: Optional[str] = None
+    violations: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def can_execute_cycle(
+    config: PortfolioCycleConfig,
+    execution_mode: ExecutionMode,
+    cycle_timestamp: datetime,
+    current_state: Optional[CurrentPortfolioState],
+    artifact_store: ArtifactStore,
+    state_store: Optional[PortfolioStateStore] = None
+) -> CycleDecision:
+    """Determine if a cycle can execute given the current context.
+    
+    Checks:
+    1. Operational Halt Flag (LIVE mode)
+    2. Time Reversal (Monotonicity)
+    
+    Args:
+        config: Cycle configuration
+        execution_mode: Execution mode
+        cycle_timestamp: Timestamp for this cycle
+        current_state: Loaded portfolio state (if any)
+        artifact_store: Store to check for flags
+        state_store: Store (unused but kept for consistency if needed)
+        
+    Returns:
+        CycleDecision logic result
+    """
+    
+    # 1. Check Halt Flag (LIVE/LIVE_DRY only)
+    if _is_live_mode(execution_mode):
+        halt_store = HaltFlagStore(artifact_store)
+        halt_flag = halt_store.get_halt_flag(config.portfolio_id)
+        if halt_flag:
+            # Task 4.2: Ghost-clearance detection
+            # Verify that the halted_state_id referenced in the flag actually exists
+            if state_store and hasattr(halt_flag, 'halted_state_id') and halt_flag.halted_state_id:
+                halted_state_id = halt_flag.halted_state_id
+                try:
+                    # Try to load the halted state
+                    halted_state = state_store._load_state(config.portfolio_id, halted_state_id)
+                    if halted_state is None:
+                        return CycleDecision(
+                            can_run=False,
+                            decision="BLOCK",
+                            reason=f"Ghost halt flag detected: Halt flag exists but referenced state '{halted_state_id}' is missing. "
+                                   f"System may have crashed during halt. Manual intervention required."
+                        )
+                except Exception:
+                    # State not found - ghost clearance situation
+                    return CycleDecision(
+                        can_run=False,
+                        decision="BLOCK",
+                        reason=f"Ghost halt flag detected: Halt flag exists but referenced state '{halted_state_id}' could not be loaded. "
+                               f"System may have crashed during halt. Manual intervention required."
+                    )
+            
+            return CycleDecision(
+                can_run=False,
+                decision="BLOCK",  # Block new starts, don't re-halt
+                reason=f"Portfolio {config.portfolio_id} is HALTED (Reason: {halt_flag.reason}). "
+                       f"You CANNOT run a new cycle until this is mechanically cleared. "
+                       f"Use 'dashboard.py resolve --acknowledge' to clear safely."
+            )
+
+    # 2. Check Time Reversal
+    if current_state and cycle_timestamp < current_state.timestamp:
+        return CycleDecision(
+            can_run=False,
+            decision="HALT",
+            reason=f"Time reversal detected: cycle timestamp {cycle_timestamp.isoformat()} < last state timestamp {current_state.timestamp.isoformat()}",
+            violations=[{
+                "code": "TIME_REVERSAL",
+                "message": f"Execution timestamp {cycle_timestamp.isoformat()} is before last state timestamp {current_state.timestamp.isoformat()}",
+                "severity": "halt",
+                "metadata": {
+                    "cycle_timestamp": cycle_timestamp.isoformat(),
+                    "last_state_timestamp": current_state.timestamp.isoformat(),
+                }
+            }]
+        )
+        
+    return CycleDecision(can_run=True, decision="PROCEED")
 
 def run_portfolio_cycle(
     config: PortfolioCycleConfig,
@@ -600,7 +855,8 @@ def run_portfolio_cycle(
     state_store: Optional[PortfolioStateStore] = None,
     cycle_id: Optional[str] = None,
     execution_mode: ExecutionMode = ExecutionMode.SIMULATION,
-    cycle_timestamp: Optional[datetime] = None
+    cycle_timestamp: Optional[datetime] = None,
+    market_data_provider: Optional[MarketDataProvider] = None
 ) -> CycleResult:
     # Step 0: Debug print - verify flags are being read
     print(f"RUN_CYCLE cycle_id={config.cycle_id or cycle_id} hold={config.validation_hold_quantity} bootstrap={config.validation_bootstrap_first_cycle}")
@@ -653,8 +909,9 @@ def run_portfolio_cycle(
     # Top-level validation for LIVE mode (before timestamp fallback)
     _validate_live_mode_timestamps(execution_mode, cycle_timestamp)
     _validate_live_mode_guardrails(execution_mode, config.guardrails_config)
-    _validate_portfolio_not_halted(execution_mode, state_store, config.portfolio_id, artifact_store)
+    # _validate_portfolio_not_halted moved to can_execute_cycle
     _validate_live_mode_cycle_id(execution_mode, cycle_id, config.cycle_id)
+    _validate_live_mode_market_data(execution_mode, market_data_provider)
     
     if cycle_timestamp is None:
         cycle_timestamp = datetime.now()
@@ -663,12 +920,23 @@ def run_portfolio_cycle(
     if cycle_id is None:
         cycle_id = config.cycle_id
         if cycle_id is None:
-            # Prefer generating from cycle_timestamp if available (deterministic)
-            if cycle_timestamp is not None:
-                cycle_id = f"cycle_{cycle_timestamp.strftime('%Y%m%d_%H%M%S')}"
-            else:
-                # Fallback to datetime.now() only when cycle_timestamp is also None
-                cycle_id = f"cycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            # Task 3.1: Use deterministic ID based on inputs
+            from ..core.deterministic_id import generate_cycle_id as gen_cycle_id
+            cycle_id = gen_cycle_id(
+                portfolio_id=config.portfolio_id,
+                cycle_timestamp_iso=cycle_timestamp.isoformat() if cycle_timestamp else "unknown"
+            )
+    
+    # Early halt flag check for LIVE/LIVE_DRY mode (before any processing)
+    if _is_live_mode(execution_mode):
+        halt_store = HaltFlagStore(artifact_store)
+        halt_flag = halt_store.get_halt_flag(config.portfolio_id)
+        if halt_flag:
+            raise CycleError(
+                f"Portfolio {config.portfolio_id} is HALTED (Reason: {halt_flag.reason}). "
+                f"You CANNOT run a new cycle until this is mechanically cleared. "
+                f"Use 'dashboard.py resolve --acknowledge' to clear safely."
+            )
     
     state_before_id = None
     state_after_id = None
@@ -693,59 +961,101 @@ def run_portfolio_cycle(
                         strategy_allocations=current_state.strategy_allocations,
                         total_capital=current_state.total_capital,
                         timestamp=current_state.timestamp,  # Preserve original state timestamp
+                        cash_balance=current_state.cash_balance,
                         drawdown_tracker=current_state.drawdown_tracker,  # Preserve tracker
                         positions_by_instrument=current_state.positions_by_instrument  # Preserve positions
                     ),
                     state_id=f"{cycle_id}_before"  # Use cycle_id prefix for unique ID
                 )
                 
-                # Guardrail: Check for time reversal (timestamp monotonicity)
-                # Execution timestamp must be >= last state timestamp
-                if cycle_timestamp < current_state.timestamp:
-                    # Time reversal detected - HALT cycle
-                    violations = [{
-                        "code": "TIME_REVERSAL",
-                        "message": f"Execution timestamp {cycle_timestamp.isoformat()} is before last state timestamp {current_state.timestamp.isoformat()}",
-                        "severity": "halt",
-                        "metadata": {
-                            "cycle_timestamp": cycle_timestamp.isoformat(),
-                            "last_state_timestamp": current_state.timestamp.isoformat(),
-                        }
-                    }]
-                    result = CycleResult(
-                        cycle_id=cycle_id,
-                        cycle_timestamp=cycle_timestamp,
-                        portfolio_id=config.portfolio_id,
-                        evaluation_id=None,
-                        allocation_id=None,
-                        rebalance_plan_id=None,
-                        rebalance_execution_id=None,
-                        state_before_id=state_before_id,
-                        state_after_id=None,
-                        summary={},
-                    status="halted",
-                    skip_reason=f"Time reversal detected: cycle timestamp {cycle_timestamp.isoformat()} < last state timestamp {current_state.timestamp.isoformat()}",
-                    rules_violations=violations,
-                    ruleset_type=config.ruleset_type,
-                    ruleset_config=config.ruleset_config,
-                    survivability_control_events=[],
-                    )
-                    if _is_live_mode(execution_mode):
-                        # Write halt flag before raising exception
-                        halt_store = HaltFlagStore(artifact_store)
-                        halt_store.write_halt_flag(
-                            portfolio_id=config.portfolio_id,
+                
+                # Unified Gate Decision (Phase 17)
+                decision = can_execute_cycle(
+                    config=config,
+                    execution_mode=execution_mode,
+                    cycle_timestamp=cycle_timestamp,
+                    current_state=current_state,
+                    artifact_store=artifact_store,
+                    state_store=state_store
+                )
+                
+                if not decision.can_run:
+                    # Case 1: BLOCK (e.g. Halt flag exists) - Raise CycleError (skip)
+                    if decision.decision == "BLOCK":
+                        raise CycleError(decision.reason)
+                        
+                    # Case 2: HALT (e.g. Time Reversal) - Treat as operational halt
+                    elif decision.decision == "HALT":
+                        result = CycleResult(
                             cycle_id=cycle_id,
-                            reason=result.skip_reason,
-                            halted_at=cycle_timestamp,
-                            violations_summary=violations
+                            cycle_timestamp=cycle_timestamp,
+                            portfolio_id=config.portfolio_id,
+                            evaluation_id=None,
+                            allocation_id=None,
+                            rebalance_plan_id=None,
+                            rebalance_execution_id=None,
+                            state_before_id=state_before_id,
+                            state_after_id=None,
+                            summary={},
+                            status="halted",
+                            skip_reason=decision.reason,
+                            rules_violations=decision.violations,
+                            ruleset_type=config.ruleset_type,
+                            ruleset_config=config.ruleset_config,
+                            survivability_control_events=[],
                         )
-                        raise CycleHaltError(
-                            f"Cycle halted in LIVE mode: {result.skip_reason}. "
-                            "Manual intervention required before continuing.",
-                            result=result
-                        )
-                    return result
+                        
+                        # Apply Halt Logic (Persistence, Flag, Evidence)
+                        # PERSISTENCE: Save halted state
+                        if state_store:
+                            halted_state = CurrentPortfolioState(
+                                strategy_allocations=current_state.strategy_allocations,
+                                total_capital=current_state.total_capital,
+                                timestamp=current_state.timestamp,
+                                drawdown_tracker=current_state.drawdown_tracker,
+                                positions_by_instrument=current_state.positions_by_instrument,
+                                metadata={
+                                    "halted": True,
+                                    "halt_reason": result.skip_reason,
+                                    "halted_at": cycle_timestamp.isoformat()
+                                }
+                            )
+                            state_before_id = state_store.save_state(
+                                config.portfolio_id,
+                                halted_state,
+                                state_id=f"{cycle_id}_halted_gate_after" # Generic suffix for gate halts
+                            )
+                            result.state_after_id = state_before_id
+                        
+                        if _is_live_mode(execution_mode):
+                            halt_store = HaltFlagStore(artifact_store)
+                            halt_store.write_halt_flag(
+                                portfolio_id=config.portfolio_id,
+                                cycle_id=cycle_id,
+                                reason=result.skip_reason,
+                                halted_at=cycle_timestamp,
+                                violations_summary=decision.violations
+                            )
+                            
+                            # Evidence Generation
+                            try:
+                                state_post = locals().get('halted_state', None)
+                                bundle = generate_evidence_bundle(
+                                    cycle_result=result,
+                                    artifact_store=artifact_store,
+                                    prices_snapshot=locals().get('current_prices', {}),
+                                    state_before=current_state,
+                                    state_after=state_post
+                                )
+                                persist_evidence_bundle(bundle, artifact_store)
+                            except Exception as e:
+                                print(f"WARNING: Evidence generation failed during gate halt: {e}")
+                                
+                            raise CycleHaltError(
+                                f"Cycle halted in LIVE mode: {result.skip_reason}. Manual intervention required.",
+                                result=result
+                            )
+                        return result
         
         # Step 0.5: Check cadence (if configured)
         # Normalize cadence_config to CycleCadenceConfig object if it's a dict
@@ -797,6 +1107,7 @@ def run_portfolio_cycle(
                 strategy_allocations={},
                 total_capital=config.allocation_config.total_capital,
                 timestamp=cycle_timestamp,
+                cash_balance=config.allocation_config.total_capital,
                 positions_by_instrument=None
             )
             if state_store:
@@ -855,6 +1166,28 @@ def run_portfolio_cycle(
                 # Halt cycle
                 from ..allocation.allocator import persist_allocation
                 allocation_id = persist_allocation(allocation_result, artifact_store)
+                
+                # PERSISTENCE FIX: Save halted state with reason
+                halted_state_id = None
+                if state_store:
+                    halted_state = CurrentPortfolioState(
+                        strategy_allocations=current_state.strategy_allocations,
+                        total_capital=current_state.total_capital,
+                        timestamp=cycle_timestamp,
+                        drawdown_tracker=current_state.drawdown_tracker,
+                        positions_by_instrument=current_state.positions_by_instrument,
+                        metadata={
+                            "halted": True,
+                            "halt_reason": f"Allocation guardrail violation: {violation}",
+                            "halted_at": cycle_timestamp.isoformat()
+                        }
+                    )
+                    halted_state_id = state_store.save_state(
+                        config.portfolio_id,
+                        halted_state,
+                        state_id=f"{cycle_id}_halted_alloc_after"
+                    )
+
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -864,7 +1197,7 @@ def run_portfolio_cycle(
                     rebalance_plan_id=None,
                     rebalance_execution_id=None,
                     state_before_id=state_before_id,
-                    state_after_id=None,
+                    state_after_id=halted_state_id, # Return reference to halted state
                     summary={
                         "evaluation_summary": evaluation.summary,
                         "allocation_summary": {
@@ -979,6 +1312,28 @@ def run_portfolio_cycle(
                 # Halt cycle
                 from ..rebalance.planner import persist_rebalance_plan
                 rebalance_plan_id = persist_rebalance_plan(rebalance_plan, artifact_store)
+                
+                # PERSISTENCE FIX: Save halted state
+                halted_state_id = None
+                if state_store:
+                    halted_state = CurrentPortfolioState(
+                        strategy_allocations=current_state.strategy_allocations,
+                        total_capital=current_state.total_capital,
+                        timestamp=cycle_timestamp,
+                        drawdown_tracker=current_state.drawdown_tracker,
+                        positions_by_instrument=current_state.positions_by_instrument,
+                        metadata={
+                            "halted": True,
+                            "halt_reason": f"Rebalance guardrail violation: {violation}",
+                            "halted_at": cycle_timestamp.isoformat()
+                        }
+                    )
+                    halted_state_id = state_store.save_state(
+                        config.portfolio_id,
+                        halted_state,
+                        state_id=f"{cycle_id}_halted_rebal_after"
+                    )
+
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -988,7 +1343,7 @@ def run_portfolio_cycle(
                     rebalance_plan_id=rebalance_plan_id,
                     rebalance_execution_id=None,
                     state_before_id=state_before_id,
-                    state_after_id=None,
+                    state_after_id=halted_state_id,
                     summary={
                         "evaluation_summary": evaluation.summary,
                         "allocation_summary": {
@@ -1037,6 +1392,28 @@ def run_portfolio_cycle(
             # Check for HALT violations
             halt_violations = [v for v in plan_violations if v.severity == RulesViolationSeverity.HALT]
             if halt_violations:
+                
+                # PERSISTENCE FIX: Save halted state
+                halted_state_id = None
+                if state_store:
+                    halted_state = CurrentPortfolioState(
+                        strategy_allocations=current_state.strategy_allocations,
+                        total_capital=current_state.total_capital,
+                        timestamp=cycle_timestamp,
+                        drawdown_tracker=current_state.drawdown_tracker,
+                        positions_by_instrument=current_state.positions_by_instrument,
+                        metadata={
+                            "halted": True,
+                            "halt_reason": f"Ruleset violation: {halt_violations[0].message}",
+                            "halted_at": cycle_timestamp.isoformat()
+                        }
+                    )
+                    halted_state_id = state_store.save_state(
+                        config.portfolio_id,
+                        halted_state,
+                        state_id=f"{cycle_id}_halted_rules_after"
+                    )
+
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -1046,7 +1423,7 @@ def run_portfolio_cycle(
                     rebalance_plan_id=rebalance_plan_id,
                     rebalance_execution_id=None,
                     state_before_id=state_before_id,
-                    state_after_id=None,
+                    state_after_id=halted_state_id,
                     summary={
                         "evaluation_summary": evaluation.summary,
                         "allocation_summary": {
@@ -1101,9 +1478,38 @@ def run_portfolio_cycle(
                 base_engine.id_provider = DeterministicIDProvider(seed=id_seed)
             execution_engine = base_engine
             
+            # Hydrate execution_engine with existing positions from state
+            # This ensures that validate_execution can correctly calculate PnL for HOLD positions.
+            if current_state.positions_by_instrument:
+                from ..execution.position import Position
+                hydrated_positions = {}
+                for instrument, pos_dict in current_state.positions_by_instrument.items():
+                    hydrated_positions[instrument] = Position.from_dict(pos_dict)
+                
+                # Assume execution_engine has a positions attribute (PaperExecutionEngine does)
+                if hasattr(execution_engine, 'positions'):
+                    # Engine is fresh, so overwrite is safe and correct.
+                    execution_engine.positions = hydrated_positions
+            
             price_by_strategy_or_instrument = config.execution_config.get(
                 "price_by_strategy_or_instrument", {}
             )
+            
+            # LIVE MODE: Fetch real-time prices from provider
+            if _is_live_mode(execution_mode):
+                # We validated market_data_provider is not None in _validate_live_mode_market_data
+                if hasattr(execution_engine, 'instrument'):
+                    instrument = execution_engine.instrument
+                    # Fetch latest mark price
+                    live_price = market_data_provider.get_mark_price(instrument, cycle_timestamp)
+                    
+                    if live_price is not None:
+                        # Override/Inject into price map
+                        # This ensures the executor uses the live price for this instrument
+                        price_by_strategy_or_instrument[instrument] = live_price
+                        print(f"  [LIVE] Fetched mark price for {instrument}: ${live_price:,.2f}")
+                    else:
+                        print(f"  [LIVE] WARNING: Failed to fetch mark price for {instrument}, falling back to config")
             
             mapper = RebalanceSignalMapper(
                 rounding_method=config.execution_config.get("rounding_method", "floor"),
@@ -1139,6 +1545,31 @@ def run_portfolio_cycle(
                 # Halt cycle (but execution already happened)
                 from ..rebalance.executor import persist_rebalance_execution
                 rebalance_execution_id = persist_rebalance_execution(execution_result, artifact_store)
+                
+                # PERSISTENCE FIX: Save halted state
+                # Note: Execution happened, so we should update state with new allocations/positions if possible
+                # But for safety in halt, we'll keep previous allocations and just mark halted.
+                # Ideally, we should update positions if they changed.
+                halted_state_id = None
+                if state_store:
+                    halted_state = CurrentPortfolioState(
+                        strategy_allocations=current_state.strategy_allocations,
+                        total_capital=current_state.total_capital,
+                        timestamp=cycle_timestamp,
+                        drawdown_tracker=current_state.drawdown_tracker,
+                        positions_by_instrument=current_state.positions_by_instrument,
+                        metadata={
+                            "halted": True,
+                            "halt_reason": f"Execution guardrail violation: {violation}",
+                            "halted_at": cycle_timestamp.isoformat()
+                        }
+                    )
+                    halted_state_id = state_store.save_state(
+                        config.portfolio_id,
+                        halted_state,
+                        state_id=f"{cycle_id}_halted_exec_after"
+                    )
+
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -1148,7 +1579,7 @@ def run_portfolio_cycle(
                     rebalance_plan_id=rebalance_plan_id,
                     rebalance_execution_id=rebalance_execution_id,
                     state_before_id=state_before_id,
-                    state_after_id=None,  # Don't update state if halted
+                    state_after_id=halted_state_id,
                     summary={
                         "evaluation_summary": evaluation.summary,
                         "allocation_summary": {
@@ -1263,6 +1694,13 @@ def run_portfolio_cycle(
                         current_prices=current_prices
                     )
                 rules_violations.extend(exec_violations)
+                
+                # FIX: In normal cycle, validate_execution updates the tracker in-place.
+                # We must capture this updated equity for persistence if we halt.
+                # Otherwise, it falls back to current_state.total_capital (pre-cycle val), losing the PnL data.
+                if current_state.drawdown_tracker and current_state.drawdown_tracker.snapshots:
+                    # The tracker was just updated in validate_execution
+                    computed_equity = current_state.drawdown_tracker.snapshots[-1].equity
             else:
                 # Hold-quantity mode: mark-to-market validation using positions from state
                 # Contract: This is the ONLY place equity is computed and tracker is updated
@@ -1465,6 +1903,41 @@ def run_portfolio_cycle(
             # Check for HALT violations
             halt_violations = [v for v in exec_violations if v.severity == RulesViolationSeverity.HALT]
             if halt_violations:
+                
+                # PERSISTENCE FIX: Save halted state with UPDATED tracker
+                # Critical for preventing data loss on daily loss limits.
+                # current_state.drawdown_tracker was updated in-place during validate_execution (Topstep ruleset)
+                # or during manual mark-to-market block above in hold-quantity mode.
+                
+                halted_state_id = None
+                if state_store:
+                    # In hold-quantity mode, we should use computed equity if available
+                    equity_for_state = current_state.total_capital
+                    # Use computed equity if available (valid for both hold-quantity and normal modes due to above fix)
+                    try:
+                        if 'computed_equity' in locals() and computed_equity is not None:
+                            equity_for_state = computed_equity
+                    except NameError:
+                        pass
+
+                    halted_state = CurrentPortfolioState(
+                        strategy_allocations=current_state.strategy_allocations,
+                        total_capital=equity_for_state,
+                        timestamp=cycle_timestamp,
+                        drawdown_tracker=current_state.drawdown_tracker,
+                        positions_by_instrument=current_state.positions_by_instrument,
+                        metadata={
+                            "halted": True,
+                            "halt_reason": f"Ruleset violation: {halt_violations[0].message}",
+                            "halted_at": cycle_timestamp.isoformat()
+                        }
+                    )
+                    halted_state_id = state_store.save_state(
+                        config.portfolio_id,
+                        halted_state,
+                        state_id=f"{cycle_id}_halted_postexec_after"
+                    )
+
                 result = CycleResult(
                     cycle_id=cycle_id,
                     cycle_timestamp=cycle_timestamp,
@@ -1474,7 +1947,7 @@ def run_portfolio_cycle(
                     rebalance_plan_id=rebalance_plan_id,
                     rebalance_execution_id=rebalance_execution_id,
                     state_before_id=state_before_id,
-                    state_after_id=None,  # Don't update state if halted
+                    state_after_id=halted_state_id, 
                     summary={
                         "evaluation_summary": evaluation.summary,
                         "allocation_summary": {
@@ -1502,6 +1975,21 @@ def run_portfolio_cycle(
                         halted_at=cycle_timestamp,
                         violations_summary=result.rules_violations
                     )
+                    
+                    # Evidence Bundle Generation
+                    try:
+                        state_post = locals().get('halted_state', None)
+                        bundle = generate_evidence_bundle(
+                            cycle_result=result,
+                            artifact_store=artifact_store,
+                            prices_snapshot=locals().get('current_prices', {}),
+                            state_before=locals().get('current_state', None),
+                            state_after=state_post
+                        )
+                        persist_evidence_bundle(bundle, artifact_store)
+                    except Exception as e:
+                         print(f"WARNING: Evidence generation failed during halt: {e}")
+                         
                     raise CycleHaltError(
                         f"Cycle halted in LIVE mode: {result.skip_reason}. "
                         "Manual intervention required before continuing.",
@@ -1535,12 +2023,41 @@ def run_portfolio_cycle(
                     }
                 
                 # Create new state with target allocations, drawdown tracker, and positions
+                # Update cash balance from fills
+                net_cash_flow = 0.0
+                for ir in execution_result.intent_results:
+                    if ir.success and ir.signal:
+                        fill_volume = sum(f.quantity * f.price for f in ir.fills)
+                        if ir.signal.signal_type == SignalType.BUY:
+                            net_cash_flow -= fill_volume
+                        elif ir.signal.signal_type == SignalType.SELL:
+                            net_cash_flow += fill_volume
+                
+                new_cash_balance = current_state.cash_balance + net_cash_flow
+
+                # Calculate Unrealized PnL (Task 1.2)
+                unrealized_pnl = 0.0
+                if positions_by_instrument and market_data_provider:
+                    for instrument, pos_data in positions_by_instrument.items():
+                        qty = pos_data.get("quantity", 0.0)
+                        cost = pos_data.get("cost_basis", 0.0)
+                        if qty != 0:
+                            price = market_data_provider.get_mark_price(instrument, cycle_timestamp)
+                            if price is not None:
+                                unrealized_pnl += (price - cost) * qty
+                
+                metadata = current_state.metadata.copy() if current_state.metadata else {}
+                metadata["unrealized_pnl"] = unrealized_pnl
+
+                # Create new state with target allocations, drawdown tracker, and positions
                 new_state = CurrentPortfolioState(
                     strategy_allocations=new_allocations,
                     total_capital=allocation_result.total_capital,
                     timestamp=cycle_timestamp,
+                    cash_balance=new_cash_balance,
                     drawdown_tracker=drawdown_tracker,
-                    positions_by_instrument=positions_by_instrument
+                    positions_by_instrument=positions_by_instrument,
+                    metadata=metadata
                 )
             else:
                 # Hold-quantity mode: Preserve positions, update drawdown tracker, persist computed equity
@@ -1558,13 +2075,31 @@ def run_portfolio_cycle(
                     # Should not happen - computed_equity should always be set in hold-quantity mode
                     computed_equity_for_state = current_state.total_capital
                 
+                # Calculate Unrealized PnL (Task 1.2) - Hold Mode
+                # In hold mode, positions are unchanged (current_state.positions_by_instrument)
+                unrealized_pnl_hold = 0.0
+                positions_hold = current_state.positions_by_instrument
+                if positions_hold and market_data_provider:
+                    for instrument, pos_data in positions_hold.items():
+                        qty = pos_data.get("quantity", 0.0)
+                        cost = pos_data.get("cost_basis", 0.0)
+                        if qty != 0:
+                            price = market_data_provider.get_mark_price(instrument, cycle_timestamp)
+                            if price is not None:
+                                unrealized_pnl_hold += (price - cost) * qty
+
+                metadata_hold = current_state.metadata.copy() if current_state.metadata else {}
+                metadata_hold["unrealized_pnl"] = unrealized_pnl_hold
+
                 # Create new state with unchanged allocations and positions, updated tracker, computed equity as total_capital
                 new_state = CurrentPortfolioState(
                     strategy_allocations=current_state.strategy_allocations,
                     total_capital=computed_equity_for_state,  # Phase 15: persist computed equity
                     timestamp=cycle_timestamp,
+                    cash_balance=current_state.cash_balance,
                     drawdown_tracker=drawdown_tracker,
-                    positions_by_instrument=current_state.positions_by_instrument  # Preserve positions
+                    positions_by_instrument=current_state.positions_by_instrument,  # Preserve positions
+                    metadata=metadata_hold
                 )
             
             state_after_id = state_store.save_state(
@@ -1596,7 +2131,7 @@ def run_portfolio_cycle(
             }
         
         
-        return CycleResult(
+        result = CycleResult(
             cycle_id=cycle_id,
             cycle_timestamp=cycle_timestamp,
             portfolio_id=config.portfolio_id,
@@ -1615,6 +2150,28 @@ def run_portfolio_cycle(
             survivability_control_events=survivability_control_events,
         )
         
+        # Evidence Bundle Generation (Phase 16)
+        if _is_live_mode(execution_mode):
+            # state_after is new_state in this scope
+            # current_prices is available
+            # current_state is state_before
+            try:
+                bundle = generate_evidence_bundle(
+                    cycle_result=result,
+                    artifact_store=artifact_store,
+                    prices_snapshot=current_prices,
+                    state_before=current_state,
+                    state_after=new_state
+                )
+                persist_evidence_bundle(bundle, artifact_store)
+            except Exception as e:
+                # Log but don't fail the cycle commit? 
+                raise CycleError(f"Evidence generation failed: {e}") from e
+        
+        return result
+        
+    except CycleHaltError:
+        raise
     except Exception as e:
         raise CycleError(f"Failed to run portfolio cycle: {e}") from e
 

@@ -10,7 +10,7 @@ This module provides deterministic evaluation of strategies by:
 
 import json
 from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 
 from ..engines.simple import SimpleResearchEngine, RawReturns, BacktestResult
@@ -56,16 +56,41 @@ class EvaluationMetrics:
         - Penalizes timing drift, price impact, position sizing errors
     """
     
-    backtest_sharpe: float
-    backtest_total_return: float
-    backtest_max_drawdown: float
-    paper_realized_pnl: float
-    paper_total_return: float
-    divergence_final_equity: float
-    divergence_max_equity: float
-    divergence_timing_drift_avg: float
-    divergence_attribution: Dict[str, int]
-    execution_robustness_score: float
+    # Compatibility fields (aliases for backtest metrics)
+    sharpe_ratio: float = 0.0
+    total_return: float = 0.0
+    max_drawdown: float = 0.0
+
+    # Backtest metrics
+    backtest_sharpe: float = 0.0
+    backtest_total_return: float = 0.0
+    backtest_max_drawdown: float = 0.0
+    
+    # Execution metrics
+    paper_realized_pnl: float = 0.0
+    paper_total_return: float = 0.0
+    divergence_final_equity: float = 0.0
+    divergence_max_equity: float = 0.0
+    divergence_timing_drift_avg: float = 0.0
+    divergence_attribution: Dict[str, int] = field(default_factory=dict)
+    execution_robustness_score: float = 0.0
+    
+    def __post_init__(self):
+        """Sync compatibility fields if not explicitly set."""
+        if self.sharpe_ratio != 0.0 and self.backtest_sharpe == 0.0:
+            self.backtest_sharpe = self.sharpe_ratio
+        if self.total_return != 0.0 and self.backtest_total_return == 0.0:
+            self.backtest_total_return = self.total_return
+        if self.max_drawdown != 0.0 and self.backtest_max_drawdown == 0.0:
+            self.backtest_max_drawdown = self.max_drawdown
+        
+        # Reverse sync
+        if self.backtest_sharpe != 0.0 and self.sharpe_ratio == 0.0:
+            self.sharpe_ratio = self.backtest_sharpe
+        if self.backtest_total_return != 0.0 and self.total_return == 0.0:
+            self.total_return = self.backtest_total_return
+        if self.backtest_max_drawdown != 0.0 and self.max_drawdown == 0.0:
+            self.max_drawdown = self.backtest_max_drawdown
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for JSON storage."""
@@ -74,35 +99,17 @@ class EvaluationMetrics:
 
 @dataclass
 class EvaluationResult:
-    """Result of a single strategy evaluation.
-    
-    Attributes:
-        strategy_id: Identifier for the strategy/experiment
-        experiment_name: Experiment name
-        experiment_version: Experiment version
-        evaluation_timestamp: When evaluation was performed
-        backtest_result: BacktestResult from research engine
-        paper_session_id: Paper trading session identifier
-        divergence_analysis: DivergenceAnalysis comparing backtest vs paper
-        evaluation_metrics: Computed evaluation metrics
-        passed: Whether strategy passed evaluation criteria
-        failure_reasons: List of reasons if evaluation failed
-        
-    Note:
-        passed is True if all evaluation criteria are met, False otherwise.
-        failure_reasons contains human-readable explanations of failures.
-    """
-    
-    strategy_id: str
-    experiment_name: str
-    experiment_version: str
-    evaluation_timestamp: datetime
-    backtest_result: BacktestResult
-    paper_session_id: str
-    divergence_analysis: DivergenceAnalysis
-    evaluation_metrics: EvaluationMetrics
-    passed: bool
-    failure_reasons: List[str]
+    """Result of a single strategy evaluation."""
+    strategy_id: str = "unknown"
+    experiment_name: str = "unknown"
+    experiment_version: str = "unknown"
+    evaluation_timestamp: datetime = field(default_factory=datetime.now)
+    backtest_result: Any = None
+    paper_session_id: str = "unknown"
+    divergence_analysis: Any = None
+    evaluation_metrics: EvaluationMetrics = field(default_factory=EvaluationMetrics)
+    passed: bool = False
+    failure_reasons: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for JSON storage."""
@@ -122,21 +129,22 @@ class EvaluationResult:
 
 @dataclass
 class StrategyEvaluation:
-    """Complete strategy evaluation with ranking.
+    """Complete strategy evaluation with ranking."""
+    evaluation_id: str = "unknown"
+    evaluation_timestamp: datetime = field(default_factory=datetime.now)
+    results: List[EvaluationResult] = field(default_factory=list)
+    ranked_results: List[EvaluationResult] = field(default_factory=list)
+    summary: Dict[str, Any] = field(default_factory=dict)
     
-    Attributes:
-        evaluation_id: Unique identifier for this evaluation run
-        evaluation_timestamp: When evaluation was performed
-        results: List of evaluation results (one per strategy)
-        ranked_results: Results sorted by execution_robustness_score (descending)
-        summary: Summary statistics across all strategies
-    """
-    
-    evaluation_id: str
-    evaluation_timestamp: datetime
-    results: List[EvaluationResult]
-    ranked_results: List[EvaluationResult]
-    summary: Dict[str, Any]
+    # Compatibility alias
+    timestamp: Optional[datetime] = None
+
+    def __post_init__(self):
+        """Sync compatibility fields."""
+        if self.timestamp is not None:
+            self.evaluation_timestamp = self.timestamp
+        elif self.evaluation_timestamp is not None:
+            self.timestamp = self.evaluation_timestamp
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for JSON storage."""
