@@ -133,11 +133,17 @@ class SimpleResearchEngine(BaseResearchEngine):
         Raises:
             SimpleResearchEngineError: If validation fails with details
         """
-        required = {"start_date", "end_date", "initial_capital", "instrument", "strategy_type"}
+        required = {"start_date", "end_date", "initial_capital", "strategy_type"}
         missing = required - set(inputs.keys())
         if missing:
             raise SimpleResearchEngineError(
                 f"Missing required inputs: {missing}. "
+                f"Received: {list(inputs.keys())}"
+            )
+            
+        if "instrument" not in inputs and "tickers" not in inputs:
+             raise SimpleResearchEngineError(
+                f"Missing asset definition: Must provide either 'instrument' or 'tickers'. "
                 f"Received: {list(inputs.keys())}"
             )
         
@@ -174,11 +180,19 @@ class SimpleResearchEngine(BaseResearchEngine):
             )
         
         # Validate instrument
-        instrument = inputs["instrument"]
-        if not isinstance(instrument, str) or not instrument.strip():
-            raise SimpleResearchEngineError(
-                f"instrument must be non-empty string, got: {instrument}"
-            )
+        # Validate instrument or tickers
+        if "instrument" in inputs:
+            instrument = inputs["instrument"]
+            if not isinstance(instrument, str) or not instrument.strip():
+                raise SimpleResearchEngineError(
+                    f"instrument must be non-empty string, got: {instrument}"
+                )
+        elif "tickers" in inputs:
+            tickers = inputs["tickers"]
+            if not isinstance(tickers, list) or not tickers:
+                raise SimpleResearchEngineError(
+                    f"tickers must be non-empty list, got: {tickers}"
+                )
         
         # Validate strategy_type
         strategy_type = inputs["strategy_type"]
@@ -248,7 +262,12 @@ class SimpleResearchEngine(BaseResearchEngine):
         start_date = datetime.strptime(inputs["start_date"], "%Y-%m-%d")
         end_date = datetime.strptime(inputs["end_date"], "%Y-%m-%d")
         initial_capital = float(inputs["initial_capital"])
-        instrument = inputs["instrument"]
+        if "instrument" in inputs:
+            instrument = inputs["instrument"]
+        elif "tickers" in inputs and inputs["tickers"]:
+            instrument = inputs["tickers"][0]
+        else:
+            instrument = "UNKNOWN"
         
         # Generate deterministic return series
         raw_returns = self._generate_deterministic_returns(
@@ -395,10 +414,27 @@ class SimpleResearchEngine(BaseResearchEngine):
                 #   Let's do: Signal based on History[...T-1]. (If i==0, history is empty/just init).
                 
                 # Mock data provider dict for strategy
+                # Mock data provider dict for strategy
                 # Strategy expects {instrument: [prices]}
-                data_snapshot = {instrument: price_history.copy()}
+                # For multi-asset support in this simple engine, we replicate the prices for all tickers
+                data_snapshot = {}
+                if "tickers" in inputs:
+                     for ticker in inputs["tickers"]:
+                          data_snapshot[ticker] = price_history.copy()
+                else:
+                     data_snapshot = {instrument: price_history.copy()}
                 
-                signals = strategy.generate_signals(data_snapshot)
+                # Create current_positions dict
+                # In this simple engine, we track position as a float (0.0 or 1.0)
+                # We need to map this to the instruments.
+                positions_snapshot = {}
+                if "tickers" in inputs:
+                     for ticker in inputs["tickers"]:
+                          positions_snapshot[ticker] = float(current_position)
+                else:
+                     positions_snapshot = {instrument: float(current_position)}
+
+                signals = strategy.generate_signals(data_snapshot, positions_snapshot)
                 
                 # Handle single signal or list of signals
                 signal = None

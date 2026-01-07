@@ -7,6 +7,7 @@ across cycles.
 import json
 from typing import Optional, List
 from dataclasses import dataclass, asdict
+from ..execution.position import Position
 from datetime import datetime
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -156,7 +157,13 @@ class LocalPortfolioStateStore(PortfolioStateStore):
                 drawdown_tracker = DrawdownTracker.from_dict(data["drawdown_tracker"])
             
             # Load positions if present
-            positions_by_instrument = data.get("positions_by_instrument")
+            positions_by_instrument = {}
+            positions_data = data.get("positions_by_instrument")
+            if positions_data:
+                # Import Position if not already available in scope (though it should be at module level)
+                # Assuming Position is imported at module level as per prior checking
+                for instrument, pos_dict in positions_data.items():
+                    positions_by_instrument[instrument] = Position.from_dict(pos_dict)
             
             # Default cash_balance to total_capital if not in stored data (backward compatibility)
             # This ensures old state files without cash_balance don't cause $0.00 balance errors
@@ -204,10 +211,18 @@ class LocalPortfolioStateStore(PortfolioStateStore):
             if hasattr(state, 'to_dict'):
                 state_data = state.to_dict()
             else:
+                # Serialize positions using Position.to_dict()
+                positions_serialized = None
+                if hasattr(state, 'positions_by_instrument') and state.positions_by_instrument:
+                    positions_serialized = {instr: pos.to_dict() for instr, pos in state.positions_by_instrument.items()}
                 state_data = {
                     "strategy_allocations": state.strategy_allocations,
                     "total_capital": state.total_capital,
                     "timestamp": state.timestamp.isoformat(),
+                    "cash_balance": getattr(state, "cash_balance", state.total_capital),
+                    "metadata": getattr(state, "metadata", None),
+                    "drawdown_tracker": getattr(state, "drawdown_tracker", None).to_dict() if getattr(state, "drawdown_tracker", None) else None,
+                    "positions_by_instrument": positions_serialized,
                 }
             state_json = json.dumps(state_data, indent=2).encode('utf-8')
             

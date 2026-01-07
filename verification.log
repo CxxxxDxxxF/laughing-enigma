@@ -1,0 +1,118 @@
+/Users/cristianruizjr/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+2026-01-07 14:09:39,919 [INFO] Runner initialized for test_diversification in live_dry mode
+
+✅ Market OPEN (Always Open)
+2026-01-07 14:09:39,919 [INFO] Starting execution loop...
+2026-01-07 14:09:39,919 [INFO] ALERT: [INFO] Runner Started - Portfolio: test_diversification, Mode: live_dry
+
+ℹ️  DRY RUN MODE - No real trades will be executed
+[DEBUG] No state found, starting fresh.
+RUN_CYCLE cycle_id=cycle_760c76fe6c901122 hold=False bootstrap=True
+  No state loaded (first cycle)
+2026-01-07 14:09:40,062 [INFO] Syncing portfolio state with execution engine...
+2026-01-07 14:10:20,273 [ERROR] Failed to sync state with execution engine: 'AllocationConfig' object has no attribute 'strategies'
+2026-01-07 14:10:20,273 [ERROR] Unhandled Exception in Cycle: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1129, in run_portfolio_cycle
+    and len(config.allocation_config.strategies) == 1:
+AttributeError: 'AllocationConfig' object has no attribute 'strategies'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1149, in run_portfolio_cycle
+    raise CycleError(f"Critical: Failed to sync with broker in LIVE mode: {e}")
+src.lifecycle.runner.CycleError: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 250, in run
+    self._run_single_cycle(execution_engine_factory)
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 404, in _run_single_cycle
+    result = run_portfolio_cycle(
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 2244, in run_portfolio_cycle
+    raise CycleError(f"Failed to run portfolio cycle: {e}") from e
+src.lifecycle.runner.CycleError: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+2026-01-07 14:10:20,276 [ERROR] ALERT: [ERROR] Runner Error - Unhandled Exception in Cycle: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1129, in run_portfolio_cycle
+    and len(config.allocation_config.strategies) == 1:
+AttributeError: 'AllocationConfig' object has no attribute 'strategies'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1149, in run_portfolio_cycle
+    raise CycleError(f"Critical: Failed to sync with broker in LIVE mode: {e}")
+src.lifecycle.runner.CycleError: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 250, in run
+    self._run_single_cycle(execution_engine_factory)
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 404, in _run_single_cycle
+    result = run_portfolio_cycle(
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 2244, in run_portfolio_cycle
+    raise CycleError(f"Failed to run portfolio cycle: {e}") from e
+src.lifecycle.runner.CycleError: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+
+[DEBUG] No state found, starting fresh.
+RUN_CYCLE cycle_id=cycle_7ae53239f481c2bc hold=False bootstrap=True
+  No state loaded (first cycle)
+2026-01-07 14:10:20,276 [INFO] Syncing portfolio state with execution engine...
+2026-01-07 14:10:21,138 [INFO] Received signal 15. Shutting down gracefully...
+
+Shutting down gracefully... please wait for current cycle to finish.
+2026-01-07 14:11:00,451 [ERROR] Failed to sync state with execution engine: 'AllocationConfig' object has no attribute 'strategies'
+2026-01-07 14:11:00,452 [ERROR] Unhandled Exception in Cycle: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1129, in run_portfolio_cycle
+    and len(config.allocation_config.strategies) == 1:
+AttributeError: 'AllocationConfig' object has no attribute 'strategies'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1149, in run_portfolio_cycle
+    raise CycleError(f"Critical: Failed to sync with broker in LIVE mode: {e}")
+src.lifecycle.runner.CycleError: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 250, in run
+    self._run_single_cycle(execution_engine_factory)
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 404, in _run_single_cycle
+    result = run_portfolio_cycle(
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 2244, in run_portfolio_cycle
+    raise CycleError(f"Failed to run portfolio cycle: {e}") from e
+src.lifecycle.runner.CycleError: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+2026-01-07 14:11:00,452 [ERROR] ALERT: [ERROR] Runner Error - Unhandled Exception in Cycle: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1129, in run_portfolio_cycle
+    and len(config.allocation_config.strategies) == 1:
+AttributeError: 'AllocationConfig' object has no attribute 'strategies'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 1149, in run_portfolio_cycle
+    raise CycleError(f"Critical: Failed to sync with broker in LIVE mode: {e}")
+src.lifecycle.runner.CycleError: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 250, in run
+    self._run_single_cycle(execution_engine_factory)
+  File "/Users/cristianruizjr/laughing-enigma-1/scripts/run_live.py", line 404, in _run_single_cycle
+    result = run_portfolio_cycle(
+  File "/Users/cristianruizjr/laughing-enigma-1/src/lifecycle/runner.py", line 2244, in run_portfolio_cycle
+    raise CycleError(f"Failed to run portfolio cycle: {e}") from e
+src.lifecycle.runner.CycleError: Failed to run portfolio cycle: Critical: Failed to sync with broker in LIVE mode: 'AllocationConfig' object has no attribute 'strategies'
+
+2026-01-07 14:11:00,452 [INFO] Runner stopped.
+2026-01-07 14:11:00,452 [INFO] ALERT: [INFO] Runner Stopped - Graceful shutdown complete.

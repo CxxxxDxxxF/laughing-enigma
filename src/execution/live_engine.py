@@ -227,15 +227,67 @@ class LiveExecutionEngine(ExecutionEngine):
             account = self.client.get_account()
             
             import dataclasses
-            # Update capital and cash from Alpaca
-            # account.equity is total account value
-            # account.cash is available cash (using cash instead of buying_power for conservative measure)
+            # account.portfolio_value is total account value (equity)
             new_state = dataclasses.replace(
                 state,
-                total_capital=float(account.equity),
-                cash_balance=float(account.cash)
+                total_capital=float(account.portfolio_value),
+                cash_balance=float(account.buying_power)
             )
-            logger.info(f"Synced portfolio state with Alpaca: Cash=${new_state.cash_balance:.2f}, Equity=${new_state.total_capital:.2f}")
+            
+            # Fetch Positions AND Pending Orders
+            # Effective Position = Filled + Pending Buy - Pending Sell
+            positions: Dict[str, Position] = {}
+            
+            # 1. Get Filled Positions
+            alpaca_positions = self.client.get_positions()
+            for pos in alpaca_positions:
+                positions[pos.symbol] = Position(
+                    instrument=pos.symbol,
+                    quantity=float(pos.qty) if pos.side == 'long' else -float(pos.qty),
+                    cost_basis=float(pos.avg_entry_price)
+                )
+            
+            # 2. Get Pending Orders (to adjust effective exposure)
+            # This prevents double-buying when orders are open but not filled
+            try:
+                # Need to use GetOrdersRequest for alpaca-py
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+
+                req_params = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+                req = self.client._trading_client.get_orders(filter=req_params)
+                
+                for order in req:
+                    symbol = order.symbol
+                    qty = float(order.qty) if order.side == 'buy' else -float(order.qty)
+                    
+                    if symbol in positions:
+                        # Update existing position tracking
+                        current_pos = positions[symbol]
+                        # Create new position object with adjusted qty (cost basis approx)
+                        positions[symbol] = dataclasses.replace(
+                            current_pos,
+                            quantity=current_pos.quantity + qty
+                        )
+                    else:
+                        # Create new "pending" position
+                        positions[symbol] = Position(
+                            instrument=symbol,
+                            quantity=qty,
+                            cost_basis=0.0 # Unknown, but quantity matters for exposure
+                        )
+                    logger.info(f"Adjusted position for {symbol} with pending order: {qty}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch pending orders for sync: {e}")
+
+            # Update state with real positions
+            new_state = dataclasses.replace(
+                new_state,
+                positions_by_instrument=positions
+            )
+
+            logger.info(f"Synced portfolio state with Alpaca: BP=${new_state.cash_balance:.2f}, Equity=${new_state.total_capital:.2f}, Positions={len(positions)}")
             return new_state
             
         except Exception as e:

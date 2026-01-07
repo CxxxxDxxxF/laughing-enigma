@@ -87,7 +87,14 @@ class CurrentPortfolioState:
         if self.drawdown_tracker is not None:
             result["drawdown_tracker"] = self.drawdown_tracker.to_dict()
         if self.positions_by_instrument is not None:
-            result["positions_by_instrument"] = self.positions_by_instrument
+            # Handle both Dict[str, Position] and Dict[str, dict] cases
+            serialized_positions = {}
+            for k, v in self.positions_by_instrument.items():
+                if hasattr(v, 'to_dict'):
+                    serialized_positions[k] = v.to_dict()
+                else:
+                    serialized_positions[k] = v
+            result["positions_by_instrument"] = serialized_positions
         if self.metadata is not None:
             result["metadata"] = self.metadata
         return result

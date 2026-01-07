@@ -54,6 +54,7 @@ from .guardrails import GuardrailsConfig, check_allocation_guardrails, check_reb
 from ..rules import Ruleset, RulesViolation, RulesViolationSeverity
 from ..market.interface import MarketDataProvider
 from .evidence import generate_evidence_bundle, persist_evidence_bundle
+from ..core.logger import logger
 
 
 
@@ -1105,6 +1106,47 @@ def run_portfolio_cycle(
             if state_store:
                 state_before_id = state_store.save_state(config.portfolio_id, current_state)
         
+        # TASK FIX: Sync state with execution engine (Real World Source of Truth)
+        # This is critical for LIVE mode to get actual cash/buying_power.
+        if execution_engine_factory:
+            try:
+                # Instantiate engine just for sync
+                # Note: This creates a connection, syncs, then we discard it.
+                # Ideally we reuse, but factory pattern implies ephemeral use.
+                sync_engine = execution_engine_factory()
+                
+                # Verify calling sync_portfolio_state if available
+                if hasattr(sync_engine, 'sync_portfolio_state'):
+                    # Check if we should sync (mostly for LIVE/LIVE_DRY)
+                    # We can just always call it; simulation engines might execute no-op.
+                    logger.info("Syncing portfolio state with execution engine...")
+                    current_state = sync_engine.sync_portfolio_state(current_state)
+                    
+                    # Auto-attribute capital for single-strategy setups if state is desynced
+                    # This handles the case where we start with existing positions but empty allocations map
+                    if (not current_state.strategy_allocations or sum(current_state.strategy_allocations.values()) == 0) \
+                       and current_state.total_capital > 0 \
+                       and len(config.evaluation_config.strategies) == 1:
+                        
+                        single_strategy = config.evaluation_config.strategies[0].strategy_id
+                        logger.info(f"Bootstrapping allocations: Attributing ${current_state.total_capital:.2f} to {single_strategy}")
+                        current_state.strategy_allocations = {
+                            single_strategy: current_state.total_capital
+                        }
+
+                    # Persist synced state to ensure next steps use this reality
+                    if state_store:
+                        state_before_id = state_store.save_state(
+                            config.portfolio_id, 
+                            current_state,
+                            state_id=f"{cycle_id}_synced"
+                        )
+            except Exception as e:
+                # If sync fails, we warn but might proceed with cached state?
+                # For LIVE, this is bad. 
+                logger.error(f"Failed to sync state with execution engine: {e}")
+                if _is_live_mode(execution_mode):
+                     raise CycleError(f"Critical: Failed to sync with broker in LIVE mode: {e}")
         # Check if we should bootstrap first cycle or use hold-quantity validation mode
         should_use_hold_quantity_mode = config.validation_hold_quantity
         is_first_cycle = current_state is None or len(current_state.strategy_allocations) == 0

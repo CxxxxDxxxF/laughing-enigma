@@ -118,7 +118,7 @@ class ProductionRunner:
             logger.warning("LIVE MODE: Real trading enabled")
             
             # Return factory for real LiveExecutionEngine
-            return lambda: LiveExecutionEngine(instrument="SPY", alpaca_client=client, force_trades=self.force_trades)
+            return lambda: LiveExecutionEngine(instrument=None, alpaca_client=client, force_trades=self.force_trades)
             
         elif self.execution_mode == ExecutionMode.LIVE_DRY:
             # LIVE_DRY MODE: Mock execution for testing
@@ -310,20 +310,35 @@ class ProductionRunner:
         eval_config = BatchEvaluationConfig(
             strategies=[
                 StrategyConfig(
-                    strategy_id=self.strategy_name,
+                    strategy_id="dual_momentum_strict",
                     experiment_name="live_execution",
                     experiment_version="v1",
-                    experiment_config={}, # Config passed to strategy factory often comes from inputs or special field?
-                    # StrategyFactory uses experiment.config AND inputs. 
-                    # DualMomentum needs parameters.
+                    experiment_config={},
                     inputs={
                         "start_date": start_date.strftime("%Y-%m-%d"),
                         "end_date": end_date.strftime("%Y-%m-%d"),
                         "initial_capital": 100000.0,
                         "strategy_type": "dual_momentum",
                         "lookback_days": 126, 
-                        "instrument": "SPY",
-                        "top_n": 1
+                        "tickers": ["SPY", "GLD"],
+                        "threshold": 0.12,
+                        "top_n": 2
+                    }
+                ),
+                StrategyConfig(
+                    strategy_id="mean_reversion_rsi",
+                    experiment_name="live_execution",
+                    experiment_version="v1",
+                    experiment_config={},
+                    inputs={
+                        "start_date": start_date.strftime("%Y-%m-%d"),
+                        "end_date": end_date.strftime("%Y-%m-%d"),
+                        "initial_capital": 100000.0,
+                        "strategy_type": "mean_reversion",
+                        "tickers": ["SPY", "GLD"],
+                        "rsi_period": 14,
+                        "buy_threshold": 30,
+                        "sell_threshold": 70
                     }
                 )
             ]

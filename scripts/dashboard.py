@@ -147,8 +147,15 @@ def cmd_positions(args, artifact_store: LocalArtifactStore):
     print("-" * 50)
     
     for inst, data in state.positions_by_instrument.items():
-        qty = data.get('quantity', 0.0)
-        cost = data.get('cost_basis', 0.0)
+        if hasattr(data, 'quantity'):
+            # It's a Position object
+            qty = data.quantity
+            cost = data.cost_basis
+        else:
+            # It's a dict (fallback or legacy)
+            qty = data.get('quantity', 0.0)
+            cost = data.get('cost_basis', 0.0)
+            
         # We don't have current price here unless we fetch it. 
         # For now, just show Cost Value.
         print(f"{inst:<10} {qty:<10.2f} ${cost:<14.2f} {'N/A':<15}")

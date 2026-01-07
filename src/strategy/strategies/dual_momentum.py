@@ -18,7 +18,7 @@ class DualMomentumStrategy(Strategy):
     
     def __init__(self,
                  lookback_days: int = 126,
-                 threshold: float = 0.0,
+                 threshold: float = 0.12,
                  tickers: List[str] = None,
                  strategy_id: str = "dual_momentum_v1",
                  **kwargs):
@@ -36,7 +36,7 @@ class DualMomentumStrategy(Strategy):
         self.tickers = tickers if tickers is not None else ["AAPL"]
         self.strategy_id = strategy_id
 
-    def generate_signals(self, market_data: Any) -> List[Signal]:
+    def generate_signals(self, market_data: Any, current_positions: Dict[str, float] = None) -> List[Signal]:
         """Generate signals based on market data.
         
         Args:
