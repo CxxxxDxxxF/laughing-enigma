@@ -110,9 +110,17 @@ class ProductionRunner:
                 def submit_order(self, signal):
                     # Mock submission (don't call Alpaca)
                     from src.execution.order import Order, OrderStatus, OrderType
+                    from src.execution.signal import SignalType
                     import uuid
-                    # Convert SignalType to side string
-                    side = "buy" if signal.signal_type.value == "buy" else "sell"
+                    # Convert SignalType to side string - explicit mapping with error on unknown
+                    if signal.signal_type == SignalType.BUY:
+                        side = "buy"
+                    elif signal.signal_type == SignalType.SELL:
+                        side = "sell"
+                    elif signal.signal_type == SignalType.HOLD:
+                        raise ValueError(f"Cannot create order for HOLD signal: {signal}")
+                    else:
+                        raise ValueError(f"Unknown signal_type: {signal.signal_type}")
                     return Order(
                         id=str(uuid.uuid4()),
                         signal_id=None,
