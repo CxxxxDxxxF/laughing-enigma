@@ -26,11 +26,13 @@ class LiveExecutionEngine(ExecutionEngine):
     Translates internal Signals to Alpaca Orders and tracks execution.
     """
     
+
     def __init__(
         self,
         instrument: Optional[str] = None,  # Optional validation
         alpaca_client: Optional[AlpacaClient] = None,
-        risk_limits: Optional[RiskLimits] = None
+        risk_limits: Optional[RiskLimits] = None,
+        force_trades: bool = True
     ):
         """Initialize live execution engine.
         
@@ -38,11 +40,13 @@ class LiveExecutionEngine(ExecutionEngine):
             instrument: Optional instrument to restrict trading to
             alpaca_client: AlpacaClient instance
             risk_limits: Risk limits configuration
+            force_trades: If False, orders will be "accepted" locally but not sent to Alpaca.
         """
         self.instrument = instrument
         self.client = alpaca_client or AlpacaClient()
         self.risk_limits = risk_limits or RiskLimits()
         self.session_id = f"live_{uuid.uuid4().hex[:8]}"
+        self.force_trades = force_trades
         
         # Ensure connection
         if not self.client.is_connected:
@@ -53,6 +57,8 @@ class LiveExecutionEngine(ExecutionEngine):
                 
         # Cache for order tracking
         self._local_orders: Dict[str, Order] = {}
+        self._broker_order_ids: Dict[str, str] = {}  # local_id -> broker_id
+        self._fills: Dict[str, List[Fill]] = {}      # local_id -> List[Fill]
         
     def submit_order(self, signal: Signal) -> Order:
         """Submit an order to Alpaca.
@@ -74,13 +80,20 @@ class LiveExecutionEngine(ExecutionEngine):
             raise RiskLimitExceededError(f"Instrument {signal.instrument} not allow-listed")
             
         # 2. Create local order object
+        import dataclasses
         order = Order(
+            id=str(uuid.uuid4()),
             instrument=signal.instrument,
             quantity=signal.quantity,
-            side=OrderSide.BUY if signal.quantity > 0 else OrderSide.SELL,
-            type=OrderType.MARKET,  # MVP: Market orders only
-            internal_id=signal.signal_id
+            side=OrderSide.BUY.value if signal.quantity > 0 else OrderSide.SELL.value,
+            order_type=OrderType.MARKET,  # MVP: Market orders only
+            signal_id=signal.strategy_id
         )
+        # If trades are disabled, skip Alpaca submission
+        if not self.force_trades:
+            order = dataclasses.replace(order, status=OrderStatus.ACCEPTED, accepted_at=datetime.now())
+            self._local_orders[order.id] = order
+            return order
         
         # 3. Submit to Alpaca
         try:
@@ -98,15 +111,15 @@ class LiveExecutionEngine(ExecutionEngine):
             alpaca_order = self.client._trading_client.submit_order(req)
             
             # Update local order with Alpaca ID
-            order.status = OrderStatus.ACCEPTED
-            order.broker_order_id = str(alpaca_order.id)
-            self._local_orders[order.order_id] = order
+            order = dataclasses.replace(order, status=OrderStatus.ACCEPTED, accepted_at=datetime.now())
+            self._broker_order_ids[order.id] = str(alpaca_order.id)
+            self._local_orders[order.id] = order
             return order
             
         except Exception as e:
             logger.error(f"Alpaca order submission failed: {e}")
-            order.status = OrderStatus.REJECTED
-            order.rejection_reason = str(e)
+            order = dataclasses.replace(order, status=OrderStatus.REJECTED, rejection_reason=str(e))
+            self._local_orders[order.id] = order
             return order
 
     def execute_order(self, order: Order, current_price: float, timestamp: Optional[datetime] = None) -> List[Fill]:
@@ -126,23 +139,27 @@ class LiveExecutionEngine(ExecutionEngine):
         if order.status not in (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
              return []
              
-        if not order.broker_order_id:
-            logger.warning(f"Order {order.order_id} has no broker ID to check")
+        broker_id = self._broker_order_ids.get(order.id)
+        if not broker_id:
+            # If force_trades is False, we never submitted, so no broker ID.
+            # We treat this as "no fill yet" or could simulate fill if we wanted.
+            # For now, return empty to simulate pending/hold. 
+            if not self.force_trades:
+                return [] 
+            logger.warning(f"Order {order.id} has no broker ID to check")
             return []
             
         try:
             # Poll Alpaca for status
-            # For MVP, we'll wait a brief moment since this is called right after submit
-            # In a real async system we wouldn't block, but runner is synchronous
             time.sleep(1) 
             
-            alpaca_order = self.client._trading_client.get_order_by_id(order.broker_order_id)
+            alpaca_order = self.client._trading_client.get_order_by_id(broker_id)
             
             # Check status
             status = str(alpaca_order.status)
+            import dataclasses
             
             if status == 'filled':
-                order.status = OrderStatus.FILLED
                 
                 # Retrieve filled price/qty
                 fill_price = float(alpaca_order.filled_avg_price) if alpaca_order.filled_avg_price else current_price
@@ -150,27 +167,38 @@ class LiveExecutionEngine(ExecutionEngine):
                 
                 # Create fill object
                 fill = Fill(
-                    fill_id=f"fill_{order.broker_order_id}",
-                    order_id=order.order_id,
+                    fill_id=f"fill_{broker_id}",
+                    order_id=order.id,
                     instrument=order.instrument,
-                    quantity=fill_qty if order.side == OrderSide.BUY else -fill_qty,
+                    side=order.side,  # kept as string now
+                    quantity=fill_qty if order.side == "buy" else -fill_qty,
                     price=fill_price,
                     timestamp=alpaca_order.filled_at or datetime.now(),
                     fee=0.0 # TODO: Retrieve fees if available
                 )
                 
-                order.fills.append(fill)
+                # Update order
+                order = dataclasses.replace(order, status=OrderStatus.FILLED, filled_at=fill.timestamp)
+                self._local_orders[order.id] = order
+                
+                # Store fill
+                if order.id not in self._fills:
+                    self._fills[order.id] = []
+                self._fills[order.id].append(fill)
+                
                 return [fill]
                 
             elif status in ('canceled', 'expired', 'rejected'):
-                order.status = OrderStatus.CANCELED if status == 'canceled' else OrderStatus.REJECTED
+                new_status = OrderStatus.CANCELED if status == 'canceled' else OrderStatus.REJECTED
+                order = dataclasses.replace(order, status=new_status)
+                self._local_orders[order.id] = order
                 return []
                 
             # Still pending/new/accepted
             return []
             
         except Exception as e:
-            logger.error(f"Failed to check execution for order {order.order_id}: {e}")
+            logger.error(f"Failed to check execution for order {order.id}: {e}")
             return []
 
     def cancel_order(self, order_id: str) -> Order:
@@ -180,15 +208,39 @@ class LiveExecutionEngine(ExecutionEngine):
         if not order:
              raise ValueError(f"Order {order_id} not found")
              
-        if not order.broker_order_id:
+        broker_id = self._broker_order_ids.get(order.id)
+        if not broker_id:
              return order # Can't cancel what wasn't submitted
              
         try:
-            self.client._trading_client.cancel_order_by_id(order.broker_order_id)
-            order.status = OrderStatus.CANCELED
+            self.client._trading_client.cancel_order_by_id(broker_id)
+            import dataclasses
+            order = dataclasses.replace(order, status=OrderStatus.CANCELED)
+            self._local_orders[order.id] = order
             return order
         except Exception as e:
             raise ExecutionEngineError(f"Failed to cancel order: {e}")
+
+    def sync_portfolio_state(self, state: 'CurrentPortfolioState') -> 'CurrentPortfolioState':
+        """Sync state with Alpaca account."""
+        try:
+            account = self.client.get_account()
+            
+            import dataclasses
+            # Update capital and cash from Alpaca
+            # account.equity is total account value
+            # account.cash is available cash (using cash instead of buying_power for conservative measure)
+            new_state = dataclasses.replace(
+                state,
+                total_capital=float(account.equity),
+                cash_balance=float(account.cash)
+            )
+            logger.info(f"Synced portfolio state with Alpaca: Cash=${new_state.cash_balance:.2f}, Equity=${new_state.total_capital:.2f}")
+            return new_state
+            
+        except Exception as e:
+            logger.error(f"Failed to sync portfolio state: {e}")
+            return state
 
     def get_position(self, instrument: str) -> Position:
         """Get live position from Alpaca."""
@@ -198,15 +250,14 @@ class LiveExecutionEngine(ExecutionEngine):
                 if pos.symbol == instrument:
                     return Position(
                         instrument=instrument,
-                        quantity=pos.qty if pos.side == 'long' else -pos.qty,
-                        cost_basis=pos.avg_entry_price
+                        quantity=float(pos.qty) if pos.side == 'long' else -float(pos.qty),
+                        cost_basis=float(pos.avg_entry_price)
                     )
             # Not found = no position
-            return Position(instrument=instrument, quantity=0, cost_basis=0.0)
+            return Position(instrument=instrument, quantity=0.0, cost_basis=0.0)
             
         except Exception as e:
             logger.error(f"Failed to get position for {instrument}: {e}")
-            # Fallback to empty to prevent crash, but this is dangerous
             raise ExecutionEngineError(f"Failed to sync position: {e}")
 
     def get_order(self, order_id: str) -> Optional[Order]:
@@ -225,9 +276,12 @@ class LiveExecutionEngine(ExecutionEngine):
 
     def get_fills(self, order_id: str) -> List[Fill]:
         """Get fills for local order."""
-        order = self.get_order(order_id)
-        return order.fills if order else []
+        return self._fills.get(order_id, [])
 
     def reset(self) -> None:
         """Reset local state (does not affect Alpaca account!)."""
         self._local_orders.clear()
+        self._broker_order_ids.clear()
+        self._fills.clear()
+
+

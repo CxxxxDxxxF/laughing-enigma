@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.core.artifacts import LocalArtifactStore
 from src.lifecycle.state_store import LocalPortfolioStateStore
 from src.lifecycle.runner import HaltFlagStore
+from src.core.market_hours import get_session, is_market_open, time_until_open, time_until_close, CME_FUTURES, US_EQUITIES, ALWAYS_OPEN
 
 def get_latest_state(portfolio_id: str, artifact_store: LocalArtifactStore) -> Optional[Any]:
     """Load the latest portfolio state."""
@@ -68,6 +69,33 @@ def cmd_status(args, artifact_store: LocalArtifactStore):
         print(f"Total Capital: ${state.total_capital:,.2f}")
     else:
         print("\nNo state found.")
+
+def cmd_market(args, artifact_store: LocalArtifactStore):
+    """Show current market hours status for all sessions."""
+    print("--- Market Hours Status ---")
+    now = datetime.now()
+    print(f"Current Time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+    
+    sessions = [
+        ("CME Futures", CME_FUTURES),
+        ("US Equities", US_EQUITIES),
+        ("Always Open", ALWAYS_OPEN),
+    ]
+    
+    for name, session in sessions:
+        is_open = is_market_open(now, session)
+        status = "✅ OPEN" if is_open else "🔴 CLOSED"
+        
+        if is_open:
+            remaining = time_until_close(now, session)
+            remaining_str = f"Closes in {remaining.total_seconds()/3600:.1f}h" if remaining else "N/A"
+        else:
+            until_open = time_until_open(now, session)
+            remaining_str = f"Opens in {until_open.total_seconds()/3600:.1f}h" if until_open else "N/A"
+        
+        print(f"  {name:15} {status:12} ({remaining_str})")
+    
+    print("\nUse --session flag with run_live.py to select trading hours.")
 
 def cmd_metrics(args, artifact_store: LocalArtifactStore):
     """Implement metrics command."""
@@ -198,7 +226,7 @@ def cmd_manage_cash(args, artifact_store: LocalArtifactStore):
 def main():
     parser = argparse.ArgumentParser(description="Antigravity Dashboard")
     parser.add_argument("--portfolio", required=True, help="Portfolio ID")
-    parser.add_argument("--artifacts", default="./artifacts", help="Path to artifacts directory")
+    parser.add_argument("--artifacts", default="data/artifacts", help="Path to artifacts directory")
     
     subparsers = parser.add_subparsers(dest="command", required=True)
     
@@ -206,6 +234,8 @@ def main():
     subparsers.add_parser("metrics", help="Performance metrics")
     subparsers.add_parser("positions", help="Open positions")
     subparsers.add_parser("history", help="Trade history")
+    subparsers.add_parser("report", help="Generate evidence report")
+    subparsers.add_parser("market", help="Show market hours status")
     
     cash_parser = subparsers.add_parser("manage_cash", help="Manage cash balance")
     cash_parser.add_argument("--set", type=float, help="Set absolute cash balance")
@@ -225,6 +255,19 @@ def main():
         cmd_history(args, artifact_store)
     elif args.command == "manage_cash":
         cmd_manage_cash(args, artifact_store)
+    elif args.command == "market":
+        cmd_market(args, artifact_store)
+    elif args.command == "report":
+        # Generate evidence report using the existing script
+        import subprocess, shlex, sys
+        cmd = f"python {Path(__file__).parent / 'generate_report.py'} --portfolio {args.portfolio}"
+        try:
+            result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True)
+            print(result.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"Error generating report: {e}", file=sys.stderr)
+            print(e.stdout)
+            print(e.stderr, file=sys.stderr)
     else:
         parser.print_help()
 

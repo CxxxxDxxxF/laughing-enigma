@@ -37,6 +37,8 @@ from src.evaluation.batch import BatchEvaluationConfig, StrategyConfig
 from src.allocation.allocator import AllocationConfig
 from src.rebalance.planner import RebalanceConfig
 from src.core.deterministic_id import generate_cycle_id
+from src.core.market_hours import get_session, is_market_open, time_until_open, TradingSession, ALWAYS_OPEN
+from src.optimization.off_hours_runner import run_off_hours_optimization
 import src.strategy.strategies # Register strategies
 
 # Mock Market Data Provider for Dry Run
@@ -55,12 +57,18 @@ class ProductionRunner:
                  strategy_name: str, 
                  execution_mode: ExecutionMode,
                  interval_seconds: int = 60,
-                 max_cycles: Optional[int] = None):
+                 max_cycles: Optional[int] = None,
+                 session: Optional[TradingSession] = None,
+                 optimize_off_hours: bool = False,
+                 force_trades: bool = True):
         self.portfolio_id = portfolio_id
         self.strategy_name = strategy_name
         self.execution_mode = execution_mode
         self.interval_seconds = interval_seconds
         self.max_cycles = max_cycles
+        self.session = session or ALWAYS_OPEN
+        self.optimize_off_hours = optimize_off_hours
+        self.force_trades = force_trades
         self.cycles_run = 0
         
         self.running = True
@@ -72,6 +80,16 @@ class ProductionRunner:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         
         logger.info(f"Runner initialized for {portfolio_id} in {execution_mode.value} mode")
+        
+        # Display market hours status
+        now = datetime.now()
+        if is_market_open(now, self.session):
+            remaining = time_until_open(now, self.session)  # Will be None since open
+            print(f"\n✅ Market OPEN ({self.session.name})")
+        else:
+            remaining = time_until_open(now, self.session)
+            hours_until = remaining.total_seconds() / 3600 if remaining else 0
+            print(f"\n🔴 Market CLOSED ({self.session.name}) - Opens in {hours_until:.1f} hours")
 
     def _handle_shutdown(self, signum, frame):
         """Handle interrupt signals for graceful shutdown."""
@@ -81,8 +99,8 @@ class ProductionRunner:
         
     def _setup_engine_factory(self):
         """Create execution engine factory based on mode."""
-        if self.execution_mode in (ExecutionMode.LIVE, ExecutionMode.LIVE_DRY):
-            # Load Alpaca Credentials
+        if self.execution_mode == ExecutionMode.LIVE:
+            # LIVE MODE: Real Alpaca trading
             api_key = os.getenv("ALPACA_API_KEY")
             secret_key = os.getenv("ALPACA_SECRET_KEY")
             base_url = os.getenv("ALPACA_BASE_URL")
@@ -93,13 +111,31 @@ class ProductionRunner:
             config = AlpacaConfig(base_url=base_url, api_key=api_key, secret_key=secret_key)
             client = AlpacaClient(config)
             
-            # Provider
-            
-            # Provider
+            # Real market data provider
             self.market_data_provider = AlpacaMarketDataProvider(client)
             
-            # Engine Factory
-            # Mock Engine for Dry Run Verification
+            print(f"\n⚠️  LIVE MODE ENABLED - Real trades will be executed on Alpaca")
+            logger.warning("LIVE MODE: Real trading enabled")
+            
+            # Return factory for real LiveExecutionEngine
+            return lambda: LiveExecutionEngine(instrument="SPY", alpaca_client=client, force_trades=self.force_trades)
+            
+        elif self.execution_mode == ExecutionMode.LIVE_DRY:
+            # LIVE_DRY MODE: Mock execution for testing
+            api_key = os.getenv("ALPACA_API_KEY")
+            secret_key = os.getenv("ALPACA_SECRET_KEY")
+            base_url = os.getenv("ALPACA_BASE_URL")
+            
+            if not all([api_key, secret_key, base_url]):
+                 raise ValueError("Missing Alpaca credentials in environment variables")
+                 
+            config = AlpacaConfig(base_url=base_url, api_key=api_key, secret_key=secret_key)
+            client = AlpacaClient(config)
+            
+            # Provider for price data
+            self.market_data_provider = AlpacaMarketDataProvider(client)
+            
+            # Engine Factory - Mock Engine for Dry Run Verification
             class MockLiveExecutionEngine(LiveExecutionEngine):
                 def sync_portfolio_state(self, state):
                     synced = super().sync_portfolio_state(state)
@@ -112,7 +148,6 @@ class ProductionRunner:
                     from src.execution.order import Order, OrderStatus, OrderType
                     from src.execution.signal import SignalType
                     import uuid
-                    # Convert SignalType to side string - explicit mapping with error on unknown
                     if signal.signal_type == SignalType.BUY:
                         side = "buy"
                     elif signal.signal_type == SignalType.SELL:
@@ -121,6 +156,7 @@ class ProductionRunner:
                         raise ValueError(f"Cannot create order for HOLD signal: {signal}")
                     else:
                         raise ValueError(f"Unknown signal_type: {signal.signal_type}")
+                    print(f"[DRY RUN] Would submit {side.upper()} {signal.quantity} {signal.instrument}")
                     return Order(
                         id=str(uuid.uuid4()),
                         signal_id=None,
@@ -144,15 +180,13 @@ class ProductionRunner:
                         instrument=order.instrument,
                         side=order.side,
                         quantity=order.quantity,
-                        price=100.0,  # Dummy price
+                        price=100.0,
                         filled_at=datetime.now(),
                         fee=0.0
                     )
                     return [fill]
 
                 def execute_order(self, order, price, timestamp=None):
-                    # Mock immediate execution for execute_rebalance_plan compatibility
-                    # Note: Order is frozen, so we cannot mutate it
                     fill = Fill(
                         id=f"fill_{order.id}",
                         order_id=order.id,
@@ -165,15 +199,8 @@ class ProductionRunner:
                     )
                     return [fill]
 
-            # Mock Market Data Provider
-            class MockMarketDataProvider:
-                def get_latest_price(self, instrument: str) -> float:
-                    return 500.0 # Constant dummy price
-
-            mock_provider = MockMarketDataProvider()
-
-            return lambda: MockLiveExecutionEngine(instrument="SPY", alpaca_client=client) # Set instrument explicit
-            
+            print(f"\nℹ️  DRY RUN MODE - No real trades will be executed")
+            return lambda: MockLiveExecutionEngine(instrument="SPY", alpaca_client=client)
             
         else:
             raise NotImplementedError(f"Mode {self.execution_mode} not fully supported in ProductionRunner yet.")
@@ -190,6 +217,32 @@ class ProductionRunner:
                 if self.max_cycles and self.cycles_run >= self.max_cycles:
                     logger.info(f"Reached max cycles ({self.max_cycles}). Exiting.")
                     break
+                
+                # Market hours check
+                now = datetime.now()
+                if not is_market_open(now, self.session):
+                    wait_time = time_until_open(now, self.session)
+                    if wait_time:
+                        wait_seconds = wait_time.total_seconds()
+                        
+                        # Off-hours optimization
+                        if self.optimize_off_hours and wait_seconds > 60:
+                            logger.info(f"Market closed ({self.session.name}). Running off-hours optimization...")
+                            try:
+                                opt_result = run_off_hours_optimization(
+                                    portfolio_id=self.portfolio_id,
+                                    strategy_name=self.strategy_name,
+                                    artifact_store=self.artifact_store,
+                                    max_duration_seconds=min(wait_seconds - 60, 3600 * 4)  # Leave 1 min buffer
+                                )
+                                logger.info(f"Optimization complete: {opt_result.strategies_tested} tested, best: {opt_result.best_strategy_id}")
+                            except Exception as e:
+                                logger.error(f"Off-hours optimization failed: {e}")
+                        else:
+                            sleep_secs = min(wait_seconds, 3600)
+                            logger.info(f"Market closed ({self.session.name}). Sleeping {sleep_secs/60:.0f} min.")
+                            time.sleep(sleep_secs)
+                        continue
                     
                 start_time = time.time()
                 
@@ -326,7 +379,14 @@ class ProductionRunner:
         cycle_timestamp = datetime.now()
         cycle_id = generate_cycle_id(self.portfolio_id, cycle_timestamp.isoformat())
         
-        run_portfolio_cycle(
+        # DEBUG: Check state before cycle
+        current_state = self.state_store.load_latest_state(self.portfolio_id)
+        if current_state:
+             print(f"[DEBUG] Loaded State Cash: ${current_state.cash_balance:.2f} Capital: ${current_state.total_capital:.2f}")
+        else:
+             print("[DEBUG] No state found, starting fresh.")
+
+        result = run_portfolio_cycle(
             config=config,
             research_engine=research_engine,
             artifact_store=self.artifact_store,
@@ -337,6 +397,10 @@ class ProductionRunner:
             cycle_id=cycle_id,
             market_data_provider=self.market_data_provider if self.execution_mode != ExecutionMode.LIVE_DRY else MockMarketDataProvider()
         )
+        
+        # Persist cycle result (CRITICAL for evidence generation)
+        from src.lifecycle.runner import persist_cycle_result
+        persist_cycle_result(result, self.artifact_store)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Trading System Live")
@@ -345,6 +409,12 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["LIVE", "LIVE_DRY"], default="LIVE_DRY", help="Execution Mode")
     parser.add_argument("--interval", type=int, default=60, help="Loop interval in seconds")
     parser.add_argument("--max-cycles", type=int, default=None, help="Max cycles to run (for testing)")
+    parser.add_argument("--session", choices=["cme_futures", "us_equities", "always"], default="always",
+                        help="Trading session for market hours (default: always)")
+    parser.add_argument("--optimize-off-hours", action="store_true",
+                        help="Run backtests/optimization when market is closed")
+    parser.add_argument("--no-trades", action="store_true",
+                        help="Disable actual trade submission (for debugging/safety)")
     
     args = parser.parse_args()
     
@@ -359,7 +429,10 @@ if __name__ == "__main__":
         strategy_name=args.strategy,
         execution_mode=mode_enum,
         interval_seconds=args.interval,
-        max_cycles=args.max_cycles
+        max_cycles=args.max_cycles,
+        session=get_session(args.session),
+        optimize_off_hours=args.optimize_off_hours,
+        force_trades=not args.no_trades
     )
     
     runner.run()

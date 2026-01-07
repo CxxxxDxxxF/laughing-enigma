@@ -2100,6 +2100,26 @@ def run_portfolio_cycle(
                 state_id=f"{cycle_id}_after"  # Use cycle_id prefix for unique ID
             )
         
+        # Helper to extract evidence metrics safely
+        equity = new_state.total_capital if new_state else 0.0
+        unrealized_pnl = unrealized_pnl # calculated above
+        dd_val = 0.0
+        dd_pct = 0.0
+        hwm = 0.0
+        
+        if new_state and hasattr(new_state, 'drawdown_tracker') and new_state.drawdown_tracker:
+            try:
+                # DrawdownTracker should have get_current_snapshot
+                if hasattr(new_state.drawdown_tracker, 'get_current_snapshot'):
+                    snapshot = new_state.drawdown_tracker.get_current_snapshot()
+                    if snapshot:
+                        dd_val = snapshot.trailing_drawdown
+                        dd_pct = snapshot.trailing_drawdown_pct
+                        hwm = snapshot.high_water_mark
+            except Exception:
+                # Fallback if tracker interface differs or fails
+                pass
+
         # Step 6: Compute cycle summary
         if use_normal_cycle:
             summary = {
@@ -2112,6 +2132,13 @@ def run_portfolio_cycle(
                 },
                 "rebalance_summary": rebalance_plan.metrics if rebalance_plan else {},
                 "execution_summary": execution_result.execution_summary if execution_result else {},
+                # Evidence Report Metrics
+                "equity": equity,
+                "realized_pnl": 0.0, 
+                "unrealized_pnl": unrealized_pnl,
+                "drawdown": dd_val,
+                "drawdown_pct": dd_pct,
+                "high_water_mark": hwm
             }
         else:
             # Hold-quantity mode: minimal summary
@@ -2119,7 +2146,14 @@ def run_portfolio_cycle(
                 "mode": "hold_quantity",
                 "validation_summary": {
                     "positions_count": len(current_state.positions_by_instrument) if current_state.positions_by_instrument else 0,
-                }
+                },
+                # Evidence Report Metrics
+                "equity": equity,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": unrealized_pnl,
+                "drawdown": dd_val,
+                "drawdown_pct": dd_pct,
+                "high_water_mark": hwm
             }
         
         

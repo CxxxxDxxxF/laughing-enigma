@@ -340,8 +340,12 @@ class SimpleResearchEngine(BaseResearchEngine):
             # Assume we can create it with default config or config from inputs
             # For this simple engine, we pass the inputs as config
             try:
-                # Add instrument to config
+            # Add instrument to config
                 config = inputs.copy()
+                # Compat: Ensure single-instrument optimization sets the strategy tickers
+                if "tickers" not in config and "instrument" in config:
+                    config["tickers"] = [config["instrument"]]
+                
                 strategy = StrategyFactory.create(strategy_type, config)
             except Exception as e:
                 # If creation fails, we might fall back or error. 
@@ -394,7 +398,17 @@ class SimpleResearchEngine(BaseResearchEngine):
                 # Strategy expects {instrument: [prices]}
                 data_snapshot = {instrument: price_history.copy()}
                 
-                signal = strategy.generate_signals(data_snapshot)
+                signals = strategy.generate_signals(data_snapshot)
+                
+                # Handle single signal or list of signals
+                signal = None
+                if isinstance(signals, list):
+                    # Filter for our instrument
+                    inst_signals = [s for s in signals if s.instrument == instrument]
+                    if inst_signals:
+                        signal = inst_signals[0]
+                else:
+                    signal = signals
                 
                 if signal:
                     # print(f"DEBUG: Day {i} Signal: {signal.signal_type} Momentum: {signal.metadata.get('momentum')}")

@@ -439,10 +439,9 @@ def _compute_sharpe_ratio(returns: List[float], risk_free_rate: float = 0.0) -> 
     mean_daily = returns_arr.mean()
     std_dev_daily = returns_arr.std(ddof=1)
     if std_dev_daily == 0.0:
-        raise MetricsError(
-            "Sharpe ratio is undefined when volatility is zero. "
-            "All returns are identical, so there is no risk to adjust for."
-        )
+        # Volatility is zero (all returns identical).
+        # Return 0.0 instead of crashing, as this is valid for flat/cash strategies.
+        return 0.0
     annualized_mean = mean_daily * 252
     annualized_volatility = std_dev_daily * np.sqrt(252)
     excess_return = annualized_mean - risk_free_rate
