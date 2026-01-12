@@ -1,6 +1,0 @@
-{
-  "halted_at": "2025-12-21T17:00:00",
-  "cycle_id": "cycle_20251221_170000",
-  "reason": "Allocation guardrail violation: Single strategy allocation 100.0% exceeds maximum 99.0%",
-  "violations_summary": []
-}

@@ -525,7 +525,7 @@ def analyze_validation_results(
         if metrics.min_distance_to_drawdown_violation is not None:
             print(f"  Min distance to violation: {metrics.min_distance_to_drawdown_violation:.2%}")
             if metrics.min_distance_to_drawdown_violation < 0.1:
-                print(f"    ⚠️  WARNING: Very close to limit!")
+                print(f"    [!]  WARNING: Very close to limit!")
     else:
         print("  No data available (no trailing drawdown violations with metadata)")
     print()

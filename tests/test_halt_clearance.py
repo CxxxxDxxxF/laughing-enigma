@@ -3,6 +3,7 @@ import shutil
 import json
 from pathlib import Path
 from datetime import datetime, date
+from decimal import Decimal
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -18,6 +19,7 @@ from src.data.providers import StaticMarketDataProvider
 from src.evaluation.batch import BatchEvaluationConfig, StrategyConfig
 from src.allocation.allocator import AllocationConfig
 from src.rebalance.planner import RebalanceConfig
+from src.core.instrument_spec import AAPL_EQUITY, register_instrument
 
 def setup_env(pid):
     artifacts_dir = Path(f"./artifacts_test_clearance_{pid}")
@@ -45,7 +47,7 @@ def create_config(pid, total_capital):
         guardrails_config=GuardrailsConfig(
             max_turnover_pct_per_cycle=0.999,
             max_failed_intents=100,
-            min_execution_success_rate=0.0001,
+            min_execution_success_rate=0.01,  # Test: low threshold for halt clearance test
             max_single_strategy_allocation_fraction=0.9
         )
     )
@@ -62,13 +64,16 @@ def test_prevention_of_run_while_halted():
     halt_store = HaltFlagStore(store)
     halt_store.write_halt_flag(pid, "cycle_1", "Manual Halt", datetime.now(), [])
     
+    # Register instrument
+    register_instrument(AAPL_EQUITY)
+    
     try:
         # Try to run
         run_portfolio_cycle(
             config=create_config(pid, 10000.0),
             research_engine=SimpleResearchEngine(store),
             artifact_store=store,
-            execution_engine_factory=lambda: PaperExecutionEngine("AAPL", store),
+            execution_engine_factory=lambda: PaperExecutionEngine("AAPL", store, account_cash=Decimal("100000"), account_equity=Decimal("100000")),
             cycle_timestamp=datetime.now(),
             execution_mode=ExecutionMode.LIVE_DRY,
             market_data_provider=StaticMarketDataProvider({"AAPL": 100.0}),
@@ -122,7 +127,7 @@ def test_state_continuity():
             config=create_config(pid, 10000.0),
             research_engine=SimpleResearchEngine(store),
             artifact_store=store,
-            execution_engine_factory=lambda: PaperExecutionEngine("AAPL", artifact_store=store),
+            execution_engine_factory=lambda: PaperExecutionEngine("AAPL", artifact_store=store, account_cash=Decimal("100000"), account_equity=Decimal("100000")),
             cycle_timestamp=datetime.now(),
             state_store=state_store, # Must provide state store
             execution_mode=ExecutionMode.LIVE_DRY,

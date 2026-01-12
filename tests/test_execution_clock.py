@@ -1,3 +1,4 @@
+from decimal import Decimal
 """Tests for ExecutionClock and deterministic timestamp generation."""
 
 import sys
@@ -44,11 +45,15 @@ class TestExecutionClock(TestCase):
         # Create engine with fixed clock
         engine1 = PaperExecutionEngine(
             instrument="AAPL",
-            clock=clock
+            clock=clock,
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         engine2 = PaperExecutionEngine(
             instrument="AAPL",
-            clock=clock
+            clock=clock,
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         
         # Create identical signals

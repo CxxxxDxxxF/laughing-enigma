@@ -3,6 +3,8 @@
 Provides client wrapper and execution engine for Alpaca trading API.
 """
 
+import time
+import functools
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -13,6 +15,40 @@ from ..core.config import AlpacaConfig, get_alpaca_config
 class AlpacaClientError(Exception):
     """Error from Alpaca client operations."""
     pass
+
+
+def retry_on_connection_error(max_retries: int = 3, backoff_factor: float = 1.0):
+    """Decorator to retry on connection errors with exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Base delay in seconds (doubles each retry)
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (ConnectionResetError, ConnectionError, ConnectionAbortedError) as e:
+                    last_error = e
+                    if attempt < max_retries:
+                        sleep_time = backoff_factor * (2 ** attempt)
+                        time.sleep(sleep_time)
+                except AlpacaClientError as e:
+                    # Check if it's a connection-related error
+                    err_str = str(e).lower()
+                    if 'connection' in err_str or 'reset' in err_str or 'aborted' in err_str:
+                        last_error = e
+                        if attempt < max_retries:
+                            sleep_time = backoff_factor * (2 ** attempt)
+                            time.sleep(sleep_time)
+                    else:
+                        raise  # Non-connection error, don't retry
+            raise AlpacaClientError(f"Failed after {max_retries + 1} attempts: {last_error}")
+        return wrapper
+    return decorator
 
 
 @dataclass
@@ -94,6 +130,7 @@ class AlpacaClient:
         """Check if client is connected."""
         return self._connected
     
+    @retry_on_connection_error(max_retries=3, backoff_factor=1.0)
     def get_account(self) -> AlpacaAccount:
         """Get account information.
         
@@ -120,6 +157,7 @@ class AlpacaClient:
         except Exception as e:
             raise AlpacaClientError(f"Failed to get account: {e}")
     
+    @retry_on_connection_error(max_retries=3, backoff_factor=1.0)
     def get_positions(self) -> List[AlpacaPosition]:
         """Get all open positions.
         
@@ -148,6 +186,7 @@ class AlpacaClient:
         except Exception as e:
             raise AlpacaClientError(f"Failed to get positions: {e}")
     
+    @retry_on_connection_error(max_retries=3, backoff_factor=1.0)
     def get_quote(self, symbol: str) -> AlpacaQuote:
         """Get latest quote for a symbol.
         

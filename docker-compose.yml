@@ -1,0 +1,25 @@
+services:
+  trading-bot:
+    build: .
+    container_name: antigravity-bot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+    restart: unless-stopped
+    command: ["python", "scripts/run_live.py", "--portfolio", "default", "--strategy", "dual_momentum", "--mode", "LIVE_DRY", "--session", "us_equities"]
+
+  # Dry run mode for testing
+  trading-bot-dry:
+    build: .
+    container_name: antigravity-bot-dry
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    profiles:
+      - dry-run
+    command: ["python", "scripts/run_live.py", "--portfolio", "test", "--strategy", "dual_momentum", "--mode", "LIVE_DRY", "--max-cycles", "1"]

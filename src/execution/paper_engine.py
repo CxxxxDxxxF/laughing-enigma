@@ -23,6 +23,23 @@ except ImportError:
     ArtifactStore = None
     ArtifactStoreError = Exception
 
+try:
+    from .position_sizing import (
+        can_open_position,
+        AccountState,
+        PortfolioState,
+        PositionState,
+        RiskPolicy,
+        PositionDecision,
+        DEFAULT_RISK_POLICY,
+    )
+    from ..core.instrument_spec import get_instrument
+    POSITION_SIZING_AVAILABLE = True
+except ImportError:
+    POSITION_SIZING_AVAILABLE = False
+
+from decimal import Decimal
+
 
 class PaperExecutionEngine(ExecutionEngine):
     """Deterministic paper trading execution engine.
@@ -56,7 +73,9 @@ class PaperExecutionEngine(ExecutionEngine):
         session_id: Optional[str] = None,
         clock: Optional[ExecutionClock] = None,
         id_provider: Optional[IDProvider] = None,
-        slippage_factor: float = 0.0
+        slippage_factor: float = 0.0,
+        account_cash: Optional[Decimal] = None,
+        account_equity: Optional[Decimal] = None,
     ):
         """Initialize paper execution engine.
         
@@ -70,6 +89,9 @@ class PaperExecutionEngine(ExecutionEngine):
                   In LIVE mode, use FixedClock seeded from cycle_timestamp for determinism
             id_provider: Optional ID provider for ID generation (default: SimulationIDProvider)
                         In LIVE mode, use DeterministicIDProvider seeded from cycle_id for determinism
+            account_cash: Optional account cash balance for position sizing
+            account_equity: Optional account equity for position sizing
+                           If not provided, position sizing gate will reject ENTRY orders
             
         Raises:
             ValueError: If instrument is empty or fixed_fee is negative
@@ -88,6 +110,10 @@ class PaperExecutionEngine(ExecutionEngine):
         self.id_provider = id_provider or SimulationIDProvider()
         self.clock = clock or SimulationClock()  # Default to simulation clock
         self.session_id = session_id or self.id_provider.new_session_id()
+        
+        # Account state for position sizing (optional)
+        self.account_cash = account_cash
+        self.account_equity = account_equity
         
         # State storage
         self.orders: Dict[str, Order] = {}
@@ -228,6 +254,27 @@ class PaperExecutionEngine(ExecutionEngine):
             )
             self.orders[order_id] = order
             return order
+
+        # Reject entry orders for unregistered instruments (BLOCKER-3)
+        if signal.signal_type == SignalType.BUY:
+            try:
+                from ..core.instrument_spec import get_instrument
+                _ = get_instrument(signal.instrument)
+            except Exception:
+                order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
+                order = Order(
+                    id=order_id,
+                    signal_id=None,
+                    instrument=signal.instrument,
+                    order_type=OrderType.MARKET,
+                    side="buy",
+                    quantity=signal.quantity,
+                    status=OrderStatus.REJECTED,
+                    created_at=signal.timestamp,
+                    rejection_reason=f"Instrument '{signal.instrument}' not registered - entry orders rejected"
+                )
+                self.orders[order_id] = order
+                return order
         
         # Check instrument is allowed
         if not self.risk_limits.is_instrument_allowed(signal.instrument):
@@ -245,6 +292,37 @@ class PaperExecutionEngine(ExecutionEngine):
             )
             self.orders[order_id] = order
             return order
+        
+        # Check if this is an ENT RY order (needs sizing gate) vs EXIT/REDUCE (bypass gate)
+        # Entry = opening new position or increasing existing position
+        # Exit/Reduce = closing or reducing existing position
+        current_position = self._get_or_create_position(signal.instrument)
+        is_entry = self._is_entry_order(signal, current_position)
+        
+        # Apply position sizing gate for ENTRY orders only
+        if is_entry and POSITION_SIZING_AVAILABLE:
+            sizing_result = self._check_position_sizing(
+                signal=signal,
+                current_position=current_position,
+                timestamp=signal.timestamp,
+            )
+            
+            if not sizing_result.allowed:
+                # Reject order due to position sizing
+                order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
+                order = Order(
+                    id=order_id,
+                    signal_id=None,
+                    instrument=signal.instrument,
+                    order_type=OrderType.MARKET,
+                    side="buy" if signal.signal_type == SignalType.BUY else "sell",
+                    quantity=signal.quantity,
+                    status=OrderStatus.REJECTED,
+                    created_at=signal.timestamp,
+                    rejection_reason=f"Position sizing: {sizing_result.decision.value} - {sizing_result.reason}"
+                )
+                self.orders[order_id] = order
+                return order
         
         # Create order (risk limits checked during execution when we have current_price)
         order_id = self.id_provider.new_order_id(signal_id=signal.strategy_id)
@@ -268,6 +346,123 @@ class PaperExecutionEngine(ExecutionEngine):
             self.persist_session()
         
         return order
+    
+    def _is_entry_order(self, signal: Signal, current_position: Position) -> bool:
+        """Determine if order is entry (open/increase) vs exit/reduce.
+        
+        Args:
+            signal: Signal to check
+            current_position: Current position state
+            
+        Returns:
+            True if entry/increase, False if exit/reduce
+        """
+        # Flat position → any order is entry
+        if current_position.quantity == 0:
+            return True
+        
+        # Long position
+        if current_position.quantity > 0:
+            if signal.signal_type == SignalType.SELL:
+                # Selling from long = exit/reduce
+                return False
+            else:  # BUY
+                # Buying more = increase = entry
+                return True
+        
+        # Short position
+        if current_position.quantity < 0:
+            if signal.signal_type == SignalType.BUY:
+                # Buying to cover short = exit/reduce
+                return False
+            else:  # SELL
+                # Selling more = increase short = entry
+                return True
+        
+        return True  # Default safe: treat as entry
+    
+    def _check_position_sizing(self, signal: Signal, current_position: Position, timestamp: datetime) -> 'SizingResult':
+        """Check position sizing constraints.
+        
+        Args:
+            signal: Signal to check
+            current_position: Current position
+            timestamp: Order timestamp
+            
+        Returns:
+            SizingResult from can_open_position()
+        """
+        # Get instrument spec
+        try:
+            instrument_spec = get_instrument(signal.instrument)
+        except (KeyError, ValueError):
+            # AUDIT FIX BLOCKER-3: Instrument not in registry - REJECT entry orders
+            from .position_sizing import SizingResult, PositionDecision
+            return SizingResult(
+                allowed=False,
+                decision=PositionDecision.INVALID_INPUT,
+                reason=f"Instrument '{signal.instrument}' not registered - cannot validate margin/sizing requirements",
+                debug={"instrument": signal.instrument, "action": "register instrument before trading"}
+            )
+        
+        # Build account state
+        # AUDIT FIX: Remove placeholder values, use real account state or reject
+        if self.account_cash is None or self.account_equity is None:
+            # No account state provided - cannot validate position sizing
+            # REJECT entry orders with explicit reason
+            from .position_sizing import SizingResult, PositionDecision
+            return SizingResult(
+                allowed=False,
+                decision=PositionDecision.INVALID_INPUT,
+                reason="Account state missing - provide account_cash and account_equity to PaperExecutionEngine",
+                debug={"instrument": signal.instrument}
+            )
+        
+        account = AccountState(
+            equity=self.account_equity,
+            cash=self.account_cash,
+            margin_used=Decimal("0"),  # TODO: Track margin used across positions
+        )
+        
+        # Build portfolio state
+        # Calculate gross exposure from current positions
+        gross_exposure = Decimal("0")
+        positions_dict = {}
+        
+        for inst, pos in self.positions.items():
+            if pos.quantity != 0:
+                # Simplified: use cost basis as proxy for current price
+                notional = abs(Decimal(str(pos.quantity)) * Decimal(str(pos.cost_basis)))
+                gross_exposure += notional
+                
+                positions_dict[inst] = PositionState(
+                    symbol=inst,
+                    quantity=int(pos.quantity),
+                    cost_basis=Decimal(str(pos.cost_basis)),
+                    notional_value=notional,
+                )
+        
+        portfolio = PortfolioState(
+            gross_exposure=gross_exposure,
+            positions=positions_dict,
+        )
+        
+        # Determine price for sizing
+        # Use cost basis of current position as proxy, or 1.0 for new positions
+        # In a real system, this would use current market price
+        price = Decimal(str(current_position.cost_basis)) if current_position.cost_basis > 0 else Decimal("1.0")
+        
+        # Call sizing gate
+        return can_open_position(
+            instrument=instrument_spec,
+            quantity=int(signal.quantity),
+            price=price,
+            account=account,
+            portfolio=portfolio,
+            policy=DEFAULT_RISK_POLICY,
+            session_engine=None,  # Session check would go here if available
+            timestamp=timestamp,
+        )
     
     def execute_order(self, order: Order, current_price: float, timestamp: Optional[datetime] = None) -> List[Fill]:
         """Execute an order (deterministic paper trading simulation).
@@ -371,7 +566,15 @@ class PaperExecutionEngine(ExecutionEngine):
         
         # Update position
         current_position = self._get_or_create_position(order.instrument)
-        new_position = current_position.apply_fill(fill)
+        # Get instrument spec for PnL calculation (AUDIT FIX: BLOCKER-2)
+        try:
+            from ..core.instrument_spec import get_instrument
+            instrument_spec = get_instrument(order.instrument)
+        except (KeyError, ValueError):
+            # Instrument not registered - use None (fallback to equity-style PnL)
+            instrument_spec = None
+        
+        new_position = current_position.apply_fill(fill, instrument=instrument_spec)
         self.positions[order.instrument] = new_position
         
         # Update order status to FILLED

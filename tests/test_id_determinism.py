@@ -1,4 +1,5 @@
-"""Tests for ID determinism in LIVE/LIVE_DRY mode."""
+"""Tests for deterministic ID generation in LIVE modes."""
+from decimal import Decimal
 
 import sys
 from pathlib import Path
@@ -28,12 +29,16 @@ class TestIDDeterminism(TestCase):
         engine1 = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=id_provider
+            id_provider=id_provider,
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         engine2 = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=DeterministicIDProvider(seed=cycle_id)  # New instance, same seed
+            id_provider=DeterministicIDProvider(seed=cycle_id),  # New instance, same seed
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         
         # Create identical signals
@@ -67,7 +72,9 @@ class TestIDDeterminism(TestCase):
         engine = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=id_provider
+            id_provider=id_provider,
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         
         signal = Signal(
@@ -86,7 +93,9 @@ class TestIDDeterminism(TestCase):
         engine2 = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=DeterministicIDProvider(seed=cycle_id)
+            id_provider=DeterministicIDProvider(seed=cycle_id),
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         order2 = engine2.submit_order(signal)
         fills2 = engine2.execute_order(order2, current_price=150.0, timestamp=datetime(2024, 1, 1, 12, 0, 0))
@@ -102,12 +111,16 @@ class TestIDDeterminism(TestCase):
         engine1 = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=DeterministicIDProvider(seed="cycle_20240101_120000")
+            id_provider=DeterministicIDProvider(seed="cycle_20240101_120000"),
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         engine2 = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=DeterministicIDProvider(seed="cycle_20240102_120000")  # Different seed
+            id_provider=DeterministicIDProvider(seed="cycle_20240102_120000"),  # Different seed
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         
         signal = Signal(
@@ -132,7 +145,9 @@ class TestIDDeterminism(TestCase):
         engine = PaperExecutionEngine(
             instrument="AAPL",
             clock=clock,
-            id_provider=id_provider
+            id_provider=id_provider,
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         
         signal = Signal(
@@ -161,9 +176,14 @@ class TestIDDeterminism(TestCase):
     
     def test_simulation_mode_can_use_uuid(self):
         """Test that SIMULATION mode can use UUIDs (no restriction)."""
+        clock = FixedClock(datetime(2024, 1, 1, 12, 0, 0))
+        id_provider = SimulationIDProvider()
         engine = PaperExecutionEngine(
             instrument="AAPL",
-            id_provider=SimulationIDProvider()  # Default uses UUIDs
+            id_provider=id_provider,
+            clock=clock,
+            account_cash=Decimal("100000"),
+            account_equity=Decimal("100000"),
         )
         
         signal = Signal(

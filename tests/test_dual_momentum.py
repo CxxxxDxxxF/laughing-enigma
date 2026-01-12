@@ -9,17 +9,17 @@ class TestDualMomentumStrategy(unittest.TestCase):
     
     def setUp(self):
         self.strategy = DualMomentumStrategy(
-            lookback_days=10, # Short lookback for testing
+            tickers=["TEST_ASSET"],
             threshold=0.0,
-            instrument="TEST_ASSET"
+            lookback_days=10
         )
         
     def test_insufficient_data(self):
         """Test returns None when not enough data."""
         # 5 days of data, need 10+1
         market_data = {"TEST_ASSET": [100.0] * 5}
-        signal = self.strategy.generate_signals(market_data)
-        self.assertIsNone(signal)
+        signals = self.strategy.generate_signals(market_data)
+        self.assertEqual(len(signals), 0)
         
     def test_positive_momentum(self):
         """Test BUY signal on positive momentum."""
@@ -30,9 +30,10 @@ class TestDualMomentumStrategy(unittest.TestCase):
         prices[-1] = 110.0 # Jump to 110 today
         
         market_data = {"TEST_ASSET": prices}
-        signal = self.strategy.generate_signals(market_data)
+        signals = self.strategy.generate_signals(market_data)
         
-        self.assertIsNotNone(signal)
+        self.assertEqual(len(signals), 1)
+        signal = signals[0]
         self.assertEqual(signal.signal_type, SignalType.BUY)
         self.assertEqual(signal.instrument, "TEST_ASSET")
         self.assertAlmostEqual(signal.metadata["momentum"], 0.10)
@@ -44,23 +45,24 @@ class TestDualMomentumStrategy(unittest.TestCase):
         prices[-1] = 90.0
         
         market_data = {"TEST_ASSET": prices}
-        signal = self.strategy.generate_signals(market_data)
+        signals = self.strategy.generate_signals(market_data)
         
-        self.assertIsNotNone(signal)
+        self.assertEqual(len(signals), 1)
+        signal = signals[0]
         self.assertEqual(signal.signal_type, SignalType.SELL)
         self.assertAlmostEqual(signal.metadata["momentum"], -0.10)
         
     def test_threshold_logic(self):
         """Test threshold parameter."""
         # Threshold 5%
-        custom_strategy = DualMomentumStrategy(lookback_days=10, threshold=0.05, instrument="TEST")
+        custom_strategy = DualMomentumStrategy(lookback_days=10, threshold=0.05, tickers=["TEST"])
         
         # 4% gain (below threshold) -> Should SELL/Exit
         prices = [100.0] * 10 + [104.0] 
-        signal = custom_strategy.generate_signals({"TEST": prices})
-        self.assertEqual(signal.signal_type, SignalType.SELL)
+        signals = custom_strategy.generate_signals({"TEST": prices})
+        self.assertEqual(signals[0].signal_type, SignalType.SELL)
         
         # 6% gain (above threshold) -> Should BUY
         prices = [100.0] * 10 + [106.0] 
-        signal = custom_strategy.generate_signals({"TEST": prices})
-        self.assertEqual(signal.signal_type, SignalType.BUY)
+        signals = custom_strategy.generate_signals({"TEST": prices})
+        self.assertEqual(signals[0].signal_type, SignalType.BUY)

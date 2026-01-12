@@ -88,14 +88,54 @@ class Position:
         """
         return self.absolute_quantity() * self.cost_basis
     
-    def apply_fill(self, fill: 'Fill') -> 'Position':
+    def _calculate_pnl(
+        self,
+        entry_price: float,
+        exit_price: float,
+        qty: float,
+        instrument: 'InstrumentSpec' = None,
+    ) -> float:
+        """Calculate PnL with optional instrument-aware scaling.
+        
+        AUDIT FIX: Uses centralized PnL calculation for futures scaling.
+        
+        Args:
+            entry_price: Entry cost basis
+            exit_price: Exit/fill price
+            qty: Signed quantity (+ for long, - for short)
+            instrument: Optional InstrumentSpec for futures scaling
+            
+        Returns:
+            Realized PnL in USD
+        """
+        if instrument is None:
+            # Fallback: Simple price-diff PnL (equity-style)
+            # This maintains backwards compatibility
+            if qty > 0:
+                return (exit_price - entry_price) * abs(qty)
+            else:
+                return (entry_price - exit_price) * abs(qty)
+        
+        # Use centralized PnL calculation
+        from ..core.pnl import calculate_realized_pnl_usd
+        return calculate_realized_pnl_usd(
+            instrument=instrument,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            qty=qty,
+        )
+    
+    def apply_fill(self, fill: 'Fill', instrument: 'InstrumentSpec' = None) -> 'Position':
         """Create new position by applying a fill.
         
         This is a pure function that computes the new position state
         after a fill. Used for deterministic position updates.
         
+        AUDIT FIX: Now accepts optional instrument spec for correct futures PnL scaling.
+        
         Args:
             fill: Fill to apply to this position
+            instrument: Optional InstrumentSpec for PnL calculation (required for futures)
             
         Returns:
             New Position with updated state
@@ -122,13 +162,13 @@ class Position:
         
         # Compute new cost basis and realized PnL
         if new_quantity == 0:
-            # Position closed: compute realized PnL on all shares
-            if self.is_long():
-                # Closing long: sold at fill.price
-                realized_pnl_delta = (fill.price - self.cost_basis) * abs(self.quantity)
-            else:
-                # Closing short: bought at fill.price
-                realized_pnl_delta = (self.cost_basis - fill.price) * abs(self.quantity)
+            # Position closed: compute realized PnL on all shares/contracts
+            realized_pnl_delta = self._calculate_pnl(
+                entry_price=self.cost_basis,
+                exit_price=fill.price,
+                qty=self.quantity,  # Keep sign for long/short
+                instrument=instrument,
+            )
             
             new_cost_basis = self.cost_basis  # Keep for reference, not used
             new_realized_pnl = self.realized_pnl + realized_pnl_delta
@@ -142,10 +182,14 @@ class Position:
             if new_abs_qty < old_abs_qty:
                 # Reducing position: realize PnL on closed portion, keep cost basis for remainder
                 closed_qty = old_abs_qty - new_abs_qty
-                if self.is_long():
-                    realized_pnl_delta = (fill.price - self.cost_basis) * closed_qty
-                else:
-                    realized_pnl_delta = (self.cost_basis - fill.price) * closed_qty
+                # Preserve sign: if long (qty>0), closed_qty is positive; if short (qty<0), negate it
+                signed_closed_qty = closed_qty if self.quantity > 0 else -closed_qty
+                realized_pnl_delta = self._calculate_pnl(
+                    entry_price=self.cost_basis,
+                    exit_price=fill.price,
+                    qty=signed_closed_qty,
+                    instrument=instrument,
+                )
                 new_cost_basis = self.cost_basis  # Cost basis unchanged for remaining shares
                 new_realized_pnl = self.realized_pnl + realized_pnl_delta
             else:
@@ -156,15 +200,14 @@ class Position:
             
         else:
             # Position reversed: close old position, open new
-            closed_quantity = abs(self.quantity)
-            if self.is_long():
-                # Closing long position, opening short
-                realized_pnl_delta = (fill.price - self.cost_basis) * closed_quantity
-            else:
-                # Closing short position, opening long
-                realized_pnl_delta = (self.cost_basis - fill.price) * closed_quantity
+            realized_pnl_delta = self._calculate_pnl(
+                entry_price=self.cost_basis,
+                exit_price=fill.price,
+                qty=self.quantity,  # Old position sign
+                instrument=instrument,
+            )
             
-            # New position cost basis is fill price
+            # Open new position in opposite direction
             new_cost_basis = fill.price
             new_realized_pnl = self.realized_pnl + realized_pnl_delta
         

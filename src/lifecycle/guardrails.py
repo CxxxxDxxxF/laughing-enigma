@@ -108,7 +108,10 @@ def check_rebalance_guardrails(
     """
     turnover_pct = (total_turnover / total_capital) if total_capital > 0 else 0.0
     
-    if turnover_pct > config.max_turnover_pct_per_cycle:
+    # Add small epsilon tolerance for floating point comparison
+    # This handles edge cases where turnover is exactly at the limit
+    epsilon = 1e-9
+    if turnover_pct > config.max_turnover_pct_per_cycle + epsilon:
         return False, (
             f"Turnover {turnover_pct:.1%} exceeds maximum "
             f"{config.max_turnover_pct_per_cycle:.1%} per cycle"

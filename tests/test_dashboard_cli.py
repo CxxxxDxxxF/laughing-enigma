@@ -35,7 +35,7 @@ def setup_test_env(portfolio_id: str):
         timestamp=ts,
         drawdown_tracker=tracker,
         positions_by_instrument={
-            "AAPL": {"quantity": 10.0, "cost_basis": 150.0}
+            "AAPL": {"instrument": "AAPL", "quantity": 10.0, "cost_basis": 150.0}
         },
         metadata={"test": "true"}
     )
@@ -63,7 +63,7 @@ def test_dashboard_status():
     
     # 1. Normal status
     stdout, stderr, code = run_dashboard("status", pid, artifacts_dir)
-    assert code == 0
+    assert code == 0, f"Dashboard command failed: {stderr}"
     assert "System Running" in stdout
     assert "Total Capital: $105,000.00" in stdout
     
@@ -84,7 +84,7 @@ def test_dashboard_metrics():
     artifacts_dir = setup_test_env(pid)
     
     stdout, stderr, code = run_dashboard("metrics", pid, artifacts_dir)
-    assert code == 0
+    assert code == 0, f"Dashboard command failed: {stderr}"
     assert "Equity: $105,000.00" in stdout
     # Daily PnL = Equity(105k) - Initial(100k) = 5000
     assert "Daily PnL: $5,000.00" in stdout
@@ -98,7 +98,7 @@ def test_dashboard_positions():
     artifacts_dir = setup_test_env(pid)
     
     stdout, stderr, code = run_dashboard("positions", pid, artifacts_dir)
-    assert code == 0
+    assert code == 0, f"Dashboard command failed: {stderr}"
     assert "AAPL" in stdout
     assert "10.00" in stdout # Qty
     assert "$150.00" in stdout # Cost

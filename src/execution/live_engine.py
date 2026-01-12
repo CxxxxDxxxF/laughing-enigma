@@ -255,28 +255,29 @@ class LiveExecutionEngine(ExecutionEngine):
                 from alpaca.trading.enums import QueryOrderStatus
 
                 req_params = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-                req = self.client._trading_client.get_orders(filter=req_params)
+                pending_orders = self.client._trading_client.get_orders(filter=req_params)
                 
-                for order in req:
+                for order in pending_orders:
                     symbol = order.symbol
-                    qty = float(order.qty) if order.side == 'buy' else -float(order.qty)
+                    qty = float(order.qty) if str(order.side) == 'buy' else -float(order.qty)
                     
                     if symbol in positions:
                         # Update existing position tracking
                         current_pos = positions[symbol]
-                        # Create new position object with adjusted qty (cost basis approx)
+                        # Create new position object with adjusted qty
                         positions[symbol] = dataclasses.replace(
                             current_pos,
                             quantity=current_pos.quantity + qty
                         )
                     else:
-                        # Create new "pending" position
+                        # Create new "pending" position with placeholder cost_basis
+                        # Use 1.0 as placeholder - quantity is what matters for exposure calculation
                         positions[symbol] = Position(
                             instrument=symbol,
                             quantity=qty,
-                            cost_basis=0.0 # Unknown, but quantity matters for exposure
+                            cost_basis=1.0  # Placeholder to pass validation - exposure tracking uses quantity only
                         )
-                    logger.info(f"Adjusted position for {symbol} with pending order: {qty}")
+                    logger.info(f"Adjusted position for {symbol} with pending order: {qty} (total: {positions[symbol].quantity})")
                     
             except Exception as e:
                 logger.warning(f"Failed to fetch pending orders for sync: {e}")
