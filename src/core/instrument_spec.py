@@ -257,3 +257,25 @@ def register_instrument(spec: InstrumentSpec):
         spec: InstrumentSpec to register
     """
     _INSTRUMENT_REGISTRY[spec.symbol] = spec
+
+
+def reset_registry():
+    """Reset registry to default instruments.
+    
+    Used for test isolation - restores registry to presets only.
+    """
+    global _INSTRUMENT_REGISTRY
+    _INSTRUMENT_REGISTRY = {
+        "ES": ES_FUTURE,
+        "NQ": NQ_FUTURE,
+        "CL": CL_FUTURE,
+        "GC": GC_FUTURE,
+        "ZN": ZN_FUTURE,
+        "AAPL": AAPL_EQUITY,
+        "SPY": SPY_EQUITY,
+        "QQQ": QQQ_EQUITY,
+    }
+
+
+# Initialize registry with presets
+reset_registry()
