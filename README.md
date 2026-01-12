@@ -8,7 +8,7 @@ A fully autonomous algorithmic trading system for stocks, with strategy optimiza
 # 1. Set up environment
 python3 -m venv .venv
 source .venv/bin/activate
-pip install numpy pandas python-dotenv alpaca-py
+pip install -r requirements.txt
 
 # 2. Configure Alpaca credentials
 cp .env.example .env
@@ -31,7 +31,6 @@ cp .env.example .env
 
 ## 📁 Project Structure
 
-```
 ├── scripts/                 # Executable scripts
 │   ├── run_live.py         # Main trading runner
 │   ├── dashboard.py        # CLI dashboard
@@ -44,12 +43,33 @@ cp .env.example .env
 │   ├── strategy/          # Trading strategies
 │   ├── rebalance/         # Portfolio rebalancing
 │   └── allocation/        # Position sizing
+├── ui/                     # Web Dashboard (Vite/React)
+├── tests/                  # Verification Suite
+│   ├── fixtures/          # Replay data
+│   └── ...                # Micro-simulations & Golden tests
 ├── docs/                  # Documentation
 │   ├── audits/           # System audits
 │   └── contracts/        # Design contracts
 ├── configs/              # Strategy configurations
-├── tests/                # Unit tests
 └── data/                 # Artifacts and state
+```
+
+## 🧪 Testing Strategy
+
+We employ a 3-layer safety net to ensure system reliability:
+
+1. **Micro-simulations**: Targeted tests for specific market events (gaps, dividends, splits).
+2. **Regression**: Deterministic replay of historical bugs to prevent regression.
+3. **Golden Files**: Full-system simulations validated against known-good baselines to ensure exact reproducibility.
+
+## 🖥️ Web Dashboard
+
+A modern web-based monitoring dashboard is available in the `ui/` directory.
+
+```bash
+cd ui
+npm install
+npm run dev
 ```
 
 ## 🎯 Current Strategy
